@@ -1,0 +1,516 @@
+0) analyze source code
+WinterChallenge2026-Exotec
+
+) unbound playing area
+ - positive x is right
+ - negative x is left
+ - positive y is down
+ - negative y is up
+
+ - up is unlimited
+ - left and right are unlimited and snakes can fall off by gravity
+ - bottom is solid row
+ - make the field model available for the snake to move in areas less than 0 and more than width
+    * due to wall we never can go more than height
+    * the model world width is world_width + total powerups count
+    * the world is centered in the model world and the coordinates are translated back and forth via functions.
+    * the model world height is world_height + total powerups count
+    * the world bottom is placed at model world's bottom 
+    * omg, both worlds are inverted row 0 is top most, and row HEIGHT is lowest
+    * so going UP means Y gets lower (that is very important for bug avoidance)
+    * a small diagram for 4x2 world with 2 powerups
+    0mmmmmmmm
+    1mmmmmmmm
+    2mmwwwwmm
+    3mmwwwwmm
+     01234567
+    * the model world is 2d array of numbers
+     - -1 is a wall
+     - 3 is a powerup
+    * snake body stored as deque 
+     -- own snakes
+     - snake head
+     - snake body
+     - snake tail
+     -- enemy snakes
+     -
+
+ - No snake's starting column can be directly touching (horizontally or diagonally) another snake's starting column on turn 1.
+ - 
+
+1) roles
+    we have 2-4 snakes per team
+
+ - collector of power sources
+ - platform / support
+    act as stepping stones for other own snakes. in the moment of power source eaten by the carried snake, turn to the side, to avoid penalty. 
+ - defender
+ - wall - takes space and blocks enemy snakes from reaching power sources
+ - attacker
+ - suffocator (needed 2-3 snakes)
+    surround enemy snake and make it crash
+ - killer (needed len > 4 or len > enemy_len)
+    intercept and crash small 3 cell enemy -  The only offensive play that's worth the penalty is head-hunting baby enemy snakebots that are length 2 or 3 to wipe them off the board completely. 
+ - turtle - spin in place to block off routes or give stepping stone
+ - delegation of roles - my team must evaluate which snake can and cant do certain actions and do something else useful
+    * too far from power sources, then not a 'collector'
+
+
+2) kill all enemy snakes strategy
+ - bad strategy, dont use it
+ - kill all enemy snakes as fast as possible
+ - keep at least one snake alive
+ - at end
+    * if ahead - kill enemy snakes
+    * if behing - ??? kill enemy snakes
+
+
+3) power sources strategies
+"A player who ignores their opponent and maximizes personal growth will often beat a player who focuses on disruption." - for non-zer sum games like this one.
+   - do not farm power source with many own snakes
+      Do not deliberately sacrifice your own snakes on the identical powerup. You are strictly better off sending exactly one snake to secure a permanent +1 size, letting the rest of your snakes freely maneuver and grow elsewhere.
+   - very very seldom split a power source with enemy snakes if possible
+      Tiebreaker Penalties: The engine tracks beheadings in a losses array (losses[b.owner.getIndex()]++). At the end of the game, ties are decided by who suffered the fewest losses. Intentionally beheading your own snakes ruins your tiebreaker score.
+   - occupy centre of the board
+      The center of the board is the most valuable real estate. Control it early to restrict your opponent's movement and create scoring opportunities.
+
+4) starting positions
+ - all snakes start vertically and with direction UP;
+ - everything is symmetrical across the center of the board
+    the map width is always an even number.
+    * snake spawns
+    * walls
+    * power sources
+
+
+5) planning routes and escape routes
+ - power sources as stepping stones for own snake
+ - futhest power source first
+ - closest power source first
+ - comparison of both strategies
+ - kill as many enemies as possible (less income for them)
+ - enemy power sources captured first
+ - like in chess, check for repeat moves
+
+6) fitness function 
+ - positive for eating power sources
+ - positive for killing enemy snakes head
+ - negative for losing head
+ - negative 3 for being killed
+ - cost for moving in that direction
+ - research alfa-beta pruning
+
+
+7) implement the game engine rules for our own simulation and future predictions
+ - add 1000ms time limit for first turn
+ - add 50ms time limit for each turn
+ - add power ups as tiles in the world matrix (not in the initial world map)
+ - power ups are received every turn
+ - add turn counter as 200 turns the game ends, YOLO mode if behind? or if ahead?
+
+8) algorithms
+ - Smart Summary for non-zero sum games: 
+    * Non-zero-sum growth: Both expand via power sources, but victory demands superior total length.​
+    * Core algos: A*/MCTS for paths; CFR for adaptive regret minimization against opponents.​​
+    * Optimal states favor spatial segregation over direct contests.
+    * Multi-Bot Coordination: Split team—one aggressive forager, others defensive blockers; default to WAIT if no safe moves.​
+
+ - non-zero sum game
+    * The total "wealth" (body parts in play) is not conserved across turns. It expands when power sources are eaten and contracts when snakebots are destroyed. A zero-sum game requires a fixed payoff pool — this game has neither a fixed pool nor a conservation law.
+    * The dominant strategic logic will therefore involve not just beating your opponent but optimizing your own growth rate — which is a hallmark of non-zero-sum dynamics.
+    * "Maximin" is a term commonly used for non-zero-sum games to describe the strategy which maximizes one's own minimum payoff. In non-zero-sum games, this is not generally the same as minimizing the opponent's maximum gain, nor the same as the Nash equilibrium strategy.
+
+
+8.1) non practicle algorithms specialized in zero-sum games:
+our game is constant-sum game at the margin — every resource your opponent doesn't get is as good as you getting one yourself.
+ - TLDR Smart Summary about zero sum games
+    * our game is not zero sum, the following algorithms are not exactly relevant, be very cautios
+    * SSS*
+    * MTD - https://en.wikipedia.org/wiki/MTD(f)
+    * BNS - https://en.wikipedia.org/wiki/Best_node_search
+    * negaC* - the beast for chess (zero-sum game)
+
+    * Core: Pathfind + Predict A*/BFS for power sources, minimax/alpha-beta for opponent traps via 3-5 ply lookahead.
+    * Multi-Agent Coord: Central eval or team rewards in MARL; block/steal from foes without suicide risks.​
+    * Exploit Rules: Safe ramming shrinks big snakes; 
+    * Perf Tradeoff: Heuristics (flood-fill, health) for speed; RL for contests needing 1000s sims.
+    * Top Performers: Alpha-beta + heuristics beat pure RL short-term; hybrids win leaderboards.
+     # common, and very cheap, heuristic is the killer heuristic, where the last move that caused a beta-cutoff at the same tree level in the tree search is always examined first. This idea can also be generalized into a set of refutation tables. 
+     # Alpha–beta search can be made even faster by considering only a narrow search window (generally determined by guesswork based on experience). This is known as an aspiration window. In the extreme case, the search is performed with alpha and beta equal; a technique known as zero-window search, null-window search, or scout search. This is particularly useful for win/loss searches near the end of a game where the extra depth gained from the narrow window and a simple win/loss evaluation function may lead to a conclusive result. If an aspiration search fails, it is straightforward to detect whether it failed high (high edge of window was too low) or low (lower edge of window was too high). This gives information about what window values might be useful in a re-search of the position. 
+
+ - Smart Summary for https://aws.amazon.com/blogs/machine-learning/building-an-ai-powered-battlesnake-with-reinforcement-learning-on-amazon-sagemaker/ 
+    * Paper Core: Frames Battlesnake as Markov game for MARL; tests PPO with HILL (action masking, reward shaping).
+    * Key Findings: HILL agents survive 30-50% longer; reward manipulation tops arena leaderboards.
+
+
+ - Pathfinding Algorithms
+    Pathfinding finds safe routes to power sources or traps, treating the grid as a graph 
+    with obstacles from snakes, walls, and predicted positions. 
+    * A* excels with heuristics like Manhattan distance, balancing speed and optimality; 
+    * BFS suits unweighted grids for shortest paths. 
+ - Search and Game Tree Methods
+    * Minimax with alpha-beta pruning simulates opponent moves over 3-5 turns, maximizing your snakes' length while minimizing foes', using heuristics like flood-fill space, health, and distance to food. 
+     + carefull not to prune good opponent moves, opponent moves optimally
+     + carefull not to prune short term bad moves, that can lead to long term good outcomes
+    * For 2-4 agents, Monte Carlo Tree Search (MCTS) samples random outcomes to evaluate team actions under time limits (e.g., 100ms/move).
+    * iterative deepening 
+      a reasonably good move can be returned even if the algorithm is interrupted before it has finished execution
+
+
+ - Reinforcement Learning
+    * RL trains policies via trial-and-error: PPO, DQN, or A3C learn from rewards like +length for power sources, -1 for shrinks, favoring long-term growth over greedy chases. Multi-agent RL (MARL) like rule-enhanced PPO coordinates your team against opponents, using shared states for cooperation.
+ - Coordination Strategies
+    * Control multiple agents with centralized evaluation (one minimax for all) or decentralized (each uses A*/minimax, prioritizing team food grabs). Heuristics trap foes by circling heads or blocking power sources, safer here since collisions don't kill short snakes.
+ - Heuristics and Scoring
+    * Evaluate states with length, food proximity, trapped-enemy count, and safe-space area (flood-fill), balancing immediate gains against long-term positioning.
+    * In Battlesnake leaderboards, alpha-beta bots rank top-10; 
+    * BFS/A* hybrids score 20-50% higher food than greedy in tests; 
+    * RL agents like PPO win 8th globally after weeks training.
+ - deplyment in codingGame for SnakeByte of RL model
+   * https://www.perplexity.ai/search/act-as-game-theorist-analize-n-ub1Ltp1hThaYuUi50vKw_Q 
+   To deploy an RL model in a pure Python source code bot (e.g., for CodinGame/SnakeByte, which runs Python 3.x without external libs or binaries), serialize the trained model using built-in pickle and load it for fast inference with NumPy arrays—no PyTorch needed at runtime.
+   Model Architecture: Hardcode a tiny feedforward net (2-3 layers, ~100-500 params for grid states) in pure Python using NumPy (standard in Python envs).
+   * End Results & Performance
+
+    Size: Full policy fits in 1-5k lines of printable base64/pickled bytes (paste into source).
+
+    Speed: NumPy matmul infers in <1ms/turn on grid games (tested in similar envs).
+
+    Usage in SnakeByte: Per-turn: simulate opponent (minimax 2-depth), encode (grid flatten + gravity-safe flags), argmax dir per bot. Beats heuristics; RL edges from training data.​
+
+    Training Tips: Use Gym/Battlesnake env proxy; self-play 1M steps → export.
+    Compress model to <10kB by pruning/quantizing to int8 (np.clip(weights, -1,1).astype('float32')).
+   * Codingame website limit is 100000Kb code, with some line limit size of say 2000 chars.
+   * variable count outputs neurons 
+      + three NN trainings and results - for 2 players, 3 players and 4 players
+      + how does the NN know which snake it controls, the postions of the snakes in the team are random, WTF!!!
+
+
+
+
+
+ - projected path in 3d array and reality check for enemies in the next turns, third dimention is time
+ - neural network
+ - what AI logic to use for prediction of enemy moves?
+    * store enemy moves in a list and infer their patterns
+    * Biggest Mistake to Avoid
+      Testing only optimal opponent behavior.
+      Real opponents often behave like:
+        + greedy bots
+        + random bots
+        + defensive bots
+      Test against all three.
+
+ - half map calculations - map is symmetrical
+ - elliminate unreachable areas - some power sources are 
+ - the three cells around the snake head are not available for our snake to move
+
+8.2) algorithm complexity
+What is the move complexity scope for 8 snakes with 3 possible moves each 
+ - is it 6500 positions to evaluate per depth and multiplying
+ - 6561^200 = 3^1600 ≈ 10^763 for full game
+ - 6561^N for N turns, 43 million for two turns
+ - Severely limiting search depth (2-3 turns max with full teams)
+ - Pruning independent snakes — snakes far from opponents and far from each other have nearly decoupled decision trees, so you can optimize them independently
+ - Replacing deep search with heuristic evaluation — your board scoring function (Voronoi zones, EPPT, length delta) does the heavy lifting, not lookahead
+ - The tree size is the mathematical argument for why a greedy growth-rate heuristic will likely outperform a shallow minimax search in this game. Lookahead buys you very little when the branching factor is 6,561.
+   * EPPT: Per snakebot, per turn: "Is this snake being used efficiently right now? * "Length delta: Whole board snapshot: "Who is currently ahead overall?"
+   * EPPT drives movement decisions, length delta drives strategic priority — which contested zones are worth fighting for given your current lead or deficit.
+
+ - Aleks personal idea - pruning enemy snakes 
+   * dont explore enemy moves at all
+   * mark the three cells next to enemy snakes unpassable (probabalistic), free each enemy tail (deterministic)
+   * repeat for depth
+   * have a deque of possible enemy snakes tail parts, that will disappear over time - correction, that will give us zero edge, as possible heads cloud will grow over possible old tails too, thus impracticle to foresee empty spaces.
+      + if a snake multiplies exponentially per turn, that gives us how many turns in the best case:
+   * 2 snakes, largest field 45x10
+   * log3((45*10)/2) = 4 turns before map fills with possible enemy heads
+   * max depth is 2 turns
+   * 3 snakes. largest field 45*15
+   * log3((45*15)/3) = 4 turns again
+
+   bot assistance - https://claude.ai/chat/2878081e-3ff5-4414-a6e5-300541594157 
+   * called reachability envelope
+   * Effective cloud size is likely **30-50% of theoretical**, meaning your useful depth might stretch to 3 turns on constrained maps.
+      + Gravity constrains vertical movement
+      + Platforms block paths
+      + The snake's own body blocks paths
+   * 1. Weight the cloud by path count, not binary reachable/unreachable
+      A cell reachable by 6 different paths from the enemy head is more dangerous than one reachable by only 1 path:
+      + check source code
+   * The idea is sound and practical. The main thing you give up is detecting guaranteed safe corridors — you'll sometimes avoid cells that were actually safe. But that conservative bias is usually fine in a fast-paced resource race where being wrong about safety is fatal.
+   * Your algorithm pipeline:
+   │
+   ├── Depth 2-3: explicit pathfinding for YOUR snakes
+   │   └── danger_map masks out high-probability enemy cells
+   │
+   ├── Evaluation: EPPT + length_delta + Voronoi zones
+   │   └── penalize moves that enter high danger_map values
+   │
+   └── Depth 4+: pure heuristic, no enemy modeling at all
+
+ - pommerman challenge - 2v2 agents with fog of war 
+   * https://en.wikipedia.org/wiki/Pommerman_Challenge
+   * branching factor of 1200, and 10 turns shadowed by explosion duration
+   * 
+
+9) resources and limitations
+ - c++ optimization
+   * GCC pragmas and attributes that influence code generation fair game? 
+   * 100000Kb source code limit
+   * 768Mb ram
+   * 73ms effective limit per turn (heuristic test on codingame)
+
+
+9) Evaluation functions
+ - final_score ≈ Σ(snakebots lengths) = starting_length + power_sources_eaten - parts_lost_to_collision
+   * 2-3-4 weight on eating an power source
+   * -2-3-4 weight on enemy eating a power source
+   * 1 weight on length loss of enemy snakes
+   * -1 weight on parts lost to collision
+   * -2*length weight on death (crash or out of bounds left or right)
+   * Tune `FUTURE_lenght` high in early game, reduce it as power sources thin out.
+
+ 
+ - Key concept: Power Source Reachability Zones
+   At any moment, partition the remaining power sources into:
+   * My exclusive zone — only your snakebots can reach them first
+   * Contested zone — both players could reach them in similar time
+   * Opponent exclusive zone — opponent reaches them faster
+
+ - The key discipline is: opponent modeling is a tiebreaker, not the primary objective. Route toward power sources first. Only deviate when a collision creates clearly positive expected value or a contested source requires you to race.
+
+ - robosnake source code
+   * How much health do I have?
+   * How much health does the enemy have?
+   * How many moves are available to me from my current position?
+   * How many moves are available to the enemy from its' current position?
+   * How many free squares can I see from my current position? (flood fill)
+   * How many free squares can the enemy see from its' current position? (another flood fill)
+   * How close am I to food?
+   * How close am I to the enemy's head?
+   * How close am I to the edge of the game board?
+ - https://aws.amazon.com/blogs/machine-learning/building-an-ai-powered-battlesnake-with-reinforcement-learning-on-amazon-sagemaker/ 
+
+10) output commands
+ - no spaces between ; and next command 
+    * valid: "0 DOWN;1 DOWN;2 DOWN;3 DOWN;"
+    * disqualification: "0 DOWN; 1 DOWN; 2 DOWN; 3 DOWN;"
+ - invalid direcitons are not penalized
+    * snake cannot move backwards and continues in the old direcion
+ - invalid snake ids are not penalized
+    * one can type enemy id and nothing happens
+
+11) possible maps
+https://www.codingame.com/replay/875667930
+https://www.codingame.com/replay/875612762
+https://www.codingame.com/replay/875604015
+
+12) killing time tactics
+ - raise up and loop at place;
+
+
+===============================================================================
+implementations: 
+ - make simple eat all power sources strategy
+ - make simple kill (head-on) all enemy snakes strategy
+ - make simple surround to kill enemy snakes strategy
+ - make simple coop-stat - reach highest power sources
+ - 
+
+Iiyan:
+ - local simulations with unlimited time, or 1sec per turn
+   * src/main/java/com/codingame/game/Referee.java On line 28
+ - choose best move
+ - choose best strategies
+ - use the same map for a seed; BEWARE for over-fitting too;
+   * The bias isn't in using static seeds for comparison — it's in using the same seeds for both tuning and comparison. Keep those two pools strictly separated and your methodology is sound.
+   * from https://claude.ai/share/62846903-d6c4-4bea-aa4a-5922c43deba3
+
+===============================================================================
+basic testing scenarios to see if proposed algorithms are sound
+1v1 snakes
+ - one powerup for me, opponent far away; my snake must fall from platform and eat the powerup on the ground. checks for gravity understanding in the internal simulator; there is a hole in the ground for snake head to die if DOWN command is given when on the platform
+ - one powerup for me, opponent on top. if i eat it, the opponent will fall and i die in 2-3 turns (delayed consequences test)
+ - the opponent is moving towards a powerup; if i don't get it, the opponent will eat it and i will drop off map in 2-3 turns
+ - the opponent is moving towards a powerup, it can reach it faster, but i can take two further powerups in the mean time (dont rush closest)
+ - exploit enemy body as platform
+ - opponent is hanging off the map (len 5 in a square); my snake len 7 can choose powerup or to bodyblock him so he drops off map. expected choise is to help him drop
+ - pathfinding with gravity - snake of len 3, power up 4 above and a tile next to the snake. expected sumulation turns - minimal: my snake must turn to the platform, climb and then reach out.
+
+2v2 snakes
+ - pathfinding - unreachable power up in the centre, four snakes len 3 horizontally on 1 block walls; two snakes per team; both must survive for 10 turns; both start at different offset on the block, to test pathfinding
+ - the opponent is moving towards a powerup, it can reach it faster, but i can block it (defensive spatial reasoning test)
+ - powerup is far away, i can collide with enemy snake and elliminate it (three colums: my snake with len 4, enemy snake with len 3, wall len 5)
+ - cooperation: one powerup, no enemies. my two snakes len 3 each must work together so that they reach the powerup at height 4-5 (search depth limited to 50 turns)
+ - "which of 5 sources to target across your two snakes" test
+
+ endgame 
+ - one last power up; my snakes have more lenght; just eat it and win
+ - one last power up; my snakes have less lenght; aggro on enemy snakes and make them lose lenght 
+
+
+
+
+------------------
+Test descriptions:
+Initial grid
+Snake bodies
+Power sources
+Expected outcome as scores
+
+modify the existing java engine to start from the state of our test.
+then run our bots and as the java engine to evaluate.
+
+
+
+additional test to generate: 
+see test-scenarios.txt
+
+===============================================================================
+AI workflow:
+ - create a Gym for snakes
+   You create a Python script that uses the local coder LLM.
+    * Agent A (Coder) writes the bot logic.
+    * Agent B (Runner) executes your Main.java runner and captures the final score.
+    * Agent C (Critic) looks at the score and the logs, tells Agent A what went wrong, and the loop repeats.
+   * Same seeds to compare algorithm versions - Controls for map variance in head-to-head
+   * Same seeds to compare algorithms - but Only valid if those seeds were never used during tuning
+   * 
+
+
+parameters for optimization:
+ - max depth of search
+ - power source rewards
+ - enemies shortened length reward
+ - own shortened length penalty
+ - own snake head loss penalty
+
+
+GameState
+ ├─ simulateTurn()
+ ├─ applyGravity()
+ └─ resolveCollisions()
+
+MoveGenerator
+
+HeuristicEvaluator
+
+MCTS
+ ├─ selection
+ ├─ expansion
+ ├─ rollout
+ └─ backpropagation
+
+ * MCTS: 
+   + deterministic tactical solver
+   + Voronoi territory heuristic
+   + opponent prediction
+
+priority stack
+1. SURVIVAL        — Never make a move that risks falling off or beheading yourself
+2. EXCLUSIVE GRABS — Collect power sources no opponent can contest in time
+3. DENIAL          — Reach contested resources ONLY if you arrive first (avoid Hawk-Hawk)
+4. TERRITORY       — Control platforms that create future exclusive corridors  
+5. TRAP SETTING    — Force opponent snakes toward edges or dead-ends
+6. SACRIFICE       — Only contest resources if your body length advantage justifies the trade
+
+
+
+
+from claude consultation: https://claude.ai/share/62846903-d6c4-4bea-aa4a-5922c43deba3
+
+def compute_reach_zones(my_bots, opponent_bots, power_sources, grid):
+    zones = {}
+    for source in power_sources:
+        my_min_dist = min(bfs_distance(bot.head, source, grid) for bot in my_bots)
+        opp_min_dist = min(bfs_distance(bot.head, source, grid) for bot in opponent_bots)
+        
+        if my_min_dist < opp_min_dist:
+            zones[source] = 'mine'
+        elif opp_min_dist < my_min_dist:
+            zones[source] = 'theirs'
+        else:
+            zones[source] = 'contested'
+    return zones
+
+-------
+Each turn:
+│
+├── 1. UPDATE world model (positions, gravity, reachability)
+│
+├── 2. COMPUTE Voronoi zones → classify each power source 
+├───── make six algorithms for the permuations of (safe zones, contested zones, enemy zones)
+├───── or just two algorithms: safe zones first, contested second and contested first , safe zones second; 
+├───── battle out the algorithms
+│
+├── 3. FOR EACH snakebot:
+│   ├── Score all possible moves by EPPT
+│   ├── Evaluate collision opportunities via collision value function  
+│   └── Assign target power source (prioritize exclusive > contested > block)
+│
+├── 4. CHECK for interference between your own bots
+│   └── Resolve routing conflicts (don't block your own snakebots)
+│
+└── 5. OUTPUT commands, favoring growth moves unless collision_value > threshold
+
+
+
+===============================================================================
+===============================================================================
+===============================================================================
+
+Development and implementation plan Aleks:
+
+# Define test cases
+
+# Implement very fast internal game engine rules, used in the bots' search algorithms
+
+# Implement bot algorithms
+## make a RL algorithm and let it train while the rest of the algorithms optimize parameters
+## how snake assignment works 
+   This is a major architecture decision that affects everything downstream.
+   — is it centralized (one search over all your snakes jointly)
+   - is it independent (each snake runs its own search)? 
+## threshold value to stop searching and to evaluate the result
+### this is a parameter, start at 49ms and move down if the bot gets timeouts penalties
+### QUESTION: how we know we timeouted? do we get 0 final score?
+## sensible logging for debugging, but not hindering performance during Training
+## Debug toggle switch
+## Test algorithm for 100% fitness against the existing tests
+#### NOTE: Requiring 100% pass rate before moving forward sounds rigorous but can become a trap. If one test case has an ambiguous correct answer (e.g. the sacrifice scenario where context determines if it's right), you'll block yourself indefinitely. Consider: some tests should be must-pass (physics correctness), others should be target-pass (strategic soundness, where 80% is acceptable initially).
+
+# Make an script that runs the adversarial plays automatically.
+## how to add agentic element and an agent loops the further optimization process?
+
+# Adversarial play - Optimize algorithm parameters 
+### via Monte Carlo combinations for the parameters
+### or via Bayesian optimization
+### or via Evolutionary tuning
+## intra algorithm competition to choose best parameters
+### the same seed for all matchups, then new seed
+### score: average score difference in the end of the match (maximize both points and wins)
+### version control best results
+## inter algorithm competitions
+### the same seed for all matchups, then new seed
+### score: total wins of eqial matches
+### version control best results
+
+# evaluate winner and best parameters per algorithm
+## see numeric results
+## watch replays
+## at this step profile the winning algorithms for most checked states
+
+# iterate (how? why? what to optimize for more checked states per 50ms window)
+## on observed bad behaviour - add scenario to test suite
+   1 detect failure
+   2 reproduce with scenario
+   3 add test
+   4 improve algorithm
+   5 re-run tournaments
+## 
+# deploy in CodinGame and wait for league placement
+
+
+
+
