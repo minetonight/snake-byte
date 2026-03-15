@@ -56,6 +56,7 @@ You are supposed to play against dummy BOSS.py that just does WAIT command.
 
 
 # bad maps - avoid
+```
 ###############
 #....@........#
 #.......@.....#
@@ -73,10 +74,10 @@ You are supposed to play against dummy BOSS.py that just does WAIT command.
     #0
     h0
     0#
-
+```
 
 # analysys
-
+```
 ###############
 #....@........#
 #.......@.....#
@@ -112,5 +113,5 @@ p1Spawns: [[(2, 4), (2, 5), (3, 5), (3, 6)]]
 p2Spawns: [[(11, 3), (11, 4), (11, 5)]]
 Bird 1360 head at: (2, 4), facing: N
 Bird 1361 head at: (11, 3), facing: N
-
+```
 

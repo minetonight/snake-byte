@@ -4,7 +4,7 @@ cd snake-byte
 git clone https://github.com/minetonight/WinterChallenge2026-Exotec.git
 ```
 
-# test all maps viable
+# test if all maps are running
 ```bash
 cd bot-developement/test-maps
 ./test-all-maps-with-boss.sh 
@@ -18,3 +18,8 @@ mvn compile exec:java -Dexec.mainClass=HeadlessMain -Dexec.classpathScope=test -
 
 ## more tools 
 see [usage.md](bot-development/test-maps/usage.md)
+
+### related repos:
+ - [gym-battlesnake](https://github.com/ArthurFirmino/gym-battlesnake)
+ - [robosnake](https://github.com/smallsco/robosnake)
+ - [sagemaker-battlesnake-ai](https://github.com/awslabs/sagemaker-battlesnake-ai)
