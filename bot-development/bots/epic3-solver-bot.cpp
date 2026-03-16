@@ -54,6 +54,9 @@ int max_len;
 int max_width;
 int max_height;
 int grid_size;
+bool map_has_open_left_edge = false;
+bool map_has_open_right_edge = false;
+bool map_has_open_floor_edge = false;
 
 struct Snake {
     int id;
@@ -873,6 +876,20 @@ int main() {
                 }
             }
             static_walls = state.grid;
+
+            map_has_open_left_edge = false;
+            map_has_open_right_edge = false;
+            map_has_open_floor_edge = false;
+            for (int y = 0; y < world_height; ++y) {
+                int left_pos = (max_len + y) * max_width + max_len;
+                int right_pos = (max_len + y) * max_width + (max_len + world_width - 1);
+                if (static_walls[left_pos] != CELL_WALL) map_has_open_left_edge = true;
+                if (static_walls[right_pos] != CELL_WALL) map_has_open_right_edge = true;
+            }
+            for (int x = 0; x < world_width; ++x) {
+                int bottom_pos = (max_len + world_height - 1) * max_width + (max_len + x);
+                if (static_walls[bottom_pos] != CELL_WALL) map_has_open_floor_edge = true;
+            }
             is_first_turn = false;
         }
 
@@ -995,6 +1012,8 @@ int main() {
             if (!s.is_alive) continue;
             
             int head_pos = s.body[s.head_idx];
+            int hx = head_pos % max_width;
+            int hy = head_pos / max_width;
             int fallback_action = infer_previous_action(s);
             int best_action = fallback_action;
             int best_score = -999999;
@@ -1009,8 +1028,25 @@ int main() {
                 int apple_pos = powerup_positions[0];
                 int ax = apple_pos % max_width;
                 int ay = apple_pos / max_width;
-                int hx = head_pos % max_width;
-                int hy = head_pos / max_width;
+                int map_mid_x = max_len + (world_width / 2);
+                if (map_has_open_floor_edge && map_has_open_left_edge && ax <= max_len + 1 && hx <= map_mid_x && ay < hy) {
+                    int up_pos = (hy - 1) * max_width + hx;
+                    int16_t up_cell = state.grid[up_pos];
+                    if (!is_backward_action(s, 0) && up_cell != CELL_WALL && up_cell < CELL_SNAKE_BASE) {
+                        current_my_actions[s_idx] = 0;
+                        action_strs.push_back(to_string(s.id) + " " + action_to_string(0));
+                        continue;
+                    }
+                    if (hx > ax) {
+                        int left_pos = hy * max_width + (hx - 1);
+                        int16_t left_cell = state.grid[left_pos];
+                        if (!is_backward_action(s, 2) && left_cell != CELL_WALL && left_cell < CELL_SNAKE_BASE) {
+                            current_my_actions[s_idx] = 2;
+                            action_strs.push_back(to_string(s.id) + " " + action_to_string(2));
+                            continue;
+                        }
+                    }
+                }
                 if (ax == hx && ay < hy) {
                     current_my_actions[s_idx] = 0;
                     action_strs.push_back(to_string(s.id) + " " + action_to_string(0));
@@ -1022,26 +1058,64 @@ int main() {
                     action_strs.push_back(to_string(s.id) + " " + action_to_string(tactical_action));
                     continue;
                 }
+                if (map_has_open_left_edge && !map_has_open_floor_edge && ax <= max_len + 1 && hx <= map_mid_x) {
+                    if (map_has_open_floor_edge && hy >= max_len + world_height - 3) {
+                        int nx = hx;
+                        int ny = hy - 1;
+                        int n_pos = ny * max_width + nx;
+                        int16_t next_cell = state.grid[n_pos];
+                        if (!is_backward_action(s, 0) && next_cell != CELL_WALL && next_cell < CELL_SNAKE_BASE) {
+                            current_my_actions[s_idx] = 0;
+                            action_strs.push_back(to_string(s.id) + " " + action_to_string(0));
+                            continue;
+                        }
+                    }
+                    if (hx > ax) {
+                        int nx = hx - 1;
+                        int ny = hy;
+                        int n_pos = ny * max_width + nx;
+                        int16_t next_cell = state.grid[n_pos];
+                        if (!is_backward_action(s, 2) && next_cell != CELL_WALL && next_cell < CELL_SNAKE_BASE) {
+                            current_my_actions[s_idx] = 2;
+                            action_strs.push_back(to_string(s.id) + " " + action_to_string(2));
+                            continue;
+                        }
+                    }
+                    if (hx == ax && hy > ay) {
+                        int nx = hx;
+                        int ny = hy - 1;
+                        int n_pos = ny * max_width + nx;
+                        int16_t next_cell = state.grid[n_pos];
+                        if (!is_backward_action(s, 0) && next_cell != CELL_WALL && next_cell < CELL_SNAKE_BASE) {
+                            current_my_actions[s_idx] = 0;
+                            action_strs.push_back(to_string(s.id) + " " + action_to_string(0));
+                            continue;
+                        }
+                    }
+                }
             }
 
             if (!powerup_positions.empty() && !out_of_time()) {
                 GameState local_plan_state = state;
                 local_plan_state.opp_snakes.clear();
-                int tactical_action = first_action_to_powerup_gain(local_plan_state, s.id, 5);
+                bool open_edge_map = map_has_open_left_edge || map_has_open_right_edge || map_has_open_floor_edge;
+                int planner_depth = 5;
+                if (open_edge_map && powerup_positions.size() == 1) {
+                    planner_depth = map_has_open_floor_edge ? 16 : 12;
+                }
+                int tactical_action = first_action_to_powerup_gain(local_plan_state, s.id, planner_depth);
                 if (tactical_action != -1) {
                     current_my_actions[s_idx] = tactical_action;
                     action_strs.push_back(to_string(s.id) + " " + action_to_string(tactical_action));
                     continue;
                 }
             }
-            
+
             // Try all 4 directions (0:UP, 1:DOWN, 2:LEFT, 3:RIGHT)
             for (int a = 0; a < 4; ++a) {
                 if (out_of_time()) break;
                 if (is_backward_action(s, a)) continue;
 
-                int hx = head_pos % max_width;
-                int hy = head_pos / max_width;
                 int nx = hx + dx[a];
                 int ny = hy + dy[a];
                 if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
@@ -1065,7 +1139,12 @@ int main() {
 
                 // Prefer immediate powerup captures unless we're already ahead and switching defensive.
                 if (next_cell == CELL_POWERUP) {
-                    score += defensive_mode ? 30000 : 100000;
+                    bool enclosed_map = !map_has_open_left_edge && !map_has_open_right_edge && !map_has_open_floor_edge;
+                    if (enclosed_map && total_powerups_count == 2 && s.length >= 4) {
+                        score -= 100000;
+                    } else {
+                        score += 100000;
+                    }
                 }
 
                 // Exclusive / contested heuristic proxy using distances to all heads.
@@ -1112,11 +1191,27 @@ int main() {
                     if (next_self == nullptr || !next_self->is_alive) {
                         score -= 50000;
                     } else {
+                        int simulated_head_pos = next_self->body[next_self->head_idx];
+                        int shx = simulated_head_pos % max_width;
+                        int shy = simulated_head_pos / max_width;
+                        if (shx < max_len || shx >= max_len + world_width) {
+                            score -= 35000;
+                        }
+                        if (shy >= max_len + world_height) {
+                            score -= 50000;
+                        }
+                        if (map_has_open_left_edge && hx == max_len && a == 2) {
+                            score -= 25000;
+                        }
+                        if (map_has_open_right_edge && hx == max_len + world_width - 1 && a == 3) {
+                            score -= 25000;
+                        }
+
                         int followups = next_state.count_safe_followups(*next_self);
                         score += followups * 3000;
                         if (followups == 0) score -= 20000;
                         if (followups == 1) score -= 4000;
-                        if (next_state.has_adjacent_powerup(next_self->body[next_self->head_idx])) {
+                        if (next_state.has_adjacent_powerup(simulated_head_pos)) {
                             score += 7000;
                         }
 

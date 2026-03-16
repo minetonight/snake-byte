@@ -53,3 +53,24 @@ Folder WinterChallenge2026-Exotec contains the game code that we are creating an
   * Search execution must decouple independent snakes. A snake safely isolated running toward its powerups does not join the Minimax permutations of a snake actively fighting an opponent.
   * Snakes process rules locally in sequence: `Survive constraints > Exclusive grabs > Safe contested grabs > Block/Trap opponents`.
   * runtime profiling of the execution tracks the time since the start of the turn and stops searching when we reach 95% of the allotted time of 73ms
+
+# post plan improvements
+## diagonal pathfinding
+  added test-maps/pathing/00-diagonal-apple-*.txt
+## falling off map
+  https://www.codingame.com/replay/877939149
+  https://www.codingame.com/replay/877938928
+  add maps with no side walls
+  
+  [new-map](../bot-development/test-maps/pathing/03-no-walls-left-h2.txt) 
+  [new-map](../bot-development/test-maps/pathing/03-no-walls-left-h3.txt) 
+  [new-map](../bot-development/test-maps/pathing/03-no-walls-right-h2.txt) 
+  [new-map](../bot-development/test-maps/pathing/03-no-walls-right-h3.txt) 
+  [new-map](../bot-development/test-maps/pathing/04-no-floor-left-h2.txt) 
+  [new-map](../bot-development/test-maps/pathing/04-no-floor-left-h3.txt) 
+  [new-map](../bot-development/test-maps/pathing/04-no-floor-right-h2.txt) 
+  [new-map](../bot-development/test-maps/pathing/04-no-floor-right-h3.txt) 
+  [new-map](../bot-development/test-maps/pathing/05-no-floor-left-fall.txt) 
+  [new-map](../bot-development/test-maps/pathing/05-no-floor-right-fall.txt)
+
+## todo add test map mirroring so that i dont make them by hand
