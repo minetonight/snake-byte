@@ -53,8 +53,16 @@ def run_simulation(bot1_path, bot2_path, map_file=None, seed=None):
     p1_match = re.search(r"Player 1 Score:\s*(-?\d+)", output)
     p2_match = re.search(r"Player 2 Score:\s*(-?\d+)", output)
     
-    p1_score = int(p1_match.group(1)) if p1_match else 0
-    p2_score = int(p2_match.group(1)) if p2_match else 0
+    if not p1_match or not p2_match:
+        print("❌ Could not find scores in output. Bot likely crashed or timed out!")
+        print("--- STDOUT ---")
+        print(output)
+        print("--- STDERR ---")
+        print(process.stderr)
+        return -1, -1
+
+    p1_score = int(p1_match.group(1))
+    p2_score = int(p2_match.group(1))
     
     # Validation against expected score
     if expected_p1 is not None or expected_p2 is not None:
@@ -70,9 +78,12 @@ def run_simulation(bot1_path, bot2_path, map_file=None, seed=None):
 
     return p1_score, p2_score
 
-def test_all_maps(bot1, bot2):
+def test_all_maps(bot1, bot2, subfolder=None):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     test_maps_dir = os.path.join(base_dir, '../test-maps')
+    if subfolder:
+        test_maps_dir = os.path.join(test_maps_dir, subfolder)
+
     
     print(f"--- Running simulations for all maps in {test_maps_dir} ---")
     
@@ -82,14 +93,15 @@ def test_all_maps(bot1, bot2):
             scores = run_simulation(bot1, bot2, map_file=map_path)
             print(f"Final Scores (P1, P2): {scores}")
 
-def manualCalls():
+def manualMode():
     # Example usage:
     # Assuming you have two python files in the same directory as this script.
     # Note: Using absolute paths is safer since the working directory during execution is inside the java project.
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    bot1 = f"python3 {os.path.join(base_dir, '../bots/my_bot_1.py')}"
+    bot1 = f"python3 {os.path.join(base_dir, 'python ../bots/my_bot_1.py')}"
     
-    bot1 = f"{os.path.join(base_dir, '../bots/test1-solver-bot.exe')}"
+    bot1 = f"{os.path.join(base_dir, '../bots/epic-2-hovering-flying-snakes.exe')}"
+    bot1 = f"{os.path.join(base_dir, '../bots/epic2-solver-bot.exe')}"
 
     # bot2 = "../bots/rightBoss.py" 
     # bot2 = "../bots/leftBoss.py" 
@@ -98,7 +110,8 @@ def manualCalls():
     # bot1 = bot2
     
     """ test all custom maps """
-    # test_all_maps(bot1, bot2)
+    test_all_maps(bot1, bot2)
+    test_all_maps(bot1, bot2, "tactics")
     
     """ test standart codingame engine """
     ###### for _ in range(5):
@@ -112,22 +125,24 @@ def manualCalls():
     # angled_snake_map = os.path.join(base_dir, '../test-maps/test_map_with2-up-angled-snake.txt')
     # print("Scores (P1, P2):", run_simulation(bot1, bot2, map_file=angled_snake_map))
 
-# if __name__ == "__main__":
-#     manualCalls()
-
 if __name__ == "__main__":
     import argparse
     import sys
-    parser = argparse.ArgumentParser(description="Run SnakeByte simulation.")
-    parser.add_argument("bot1", help="Command and absolute Path for bot 1")
-    parser.add_argument("bot2", help="Command and absolute Path for bot 2")
-    parser.add_argument("--map", dest="customMap", help="Optional path to custom map file; disables --seed param")
-    parser.add_argument("--seed", type=int, help="Optional seed for the simulation; disables --map param")
     
-    args = parser.parse_args()
-    
-    if args.customMap and args.seed:
-        print("Ambiguous call with map and seed - these arguments cannot be used together.")
-        sys.exit(1)
-    
-    print("Scores (P1, P2):", run_simulation(args.bot1, args.bot2, map_file=args.customMap, seed=args.seed))
+    if len(sys.argv) < 2:
+        print("Less than two arguments given, running in manual mode: ")
+        manualMode()
+    else:
+        parser = argparse.ArgumentParser(description="Run SnakeByte simulation.")
+        parser.add_argument("bot1", help="Command and absolute Path for bot 1")
+        parser.add_argument("bot2", help="Command and absolute Path for bot 2")
+        parser.add_argument("--map", dest="customMap", help="Optional path to custom map file; disables --seed param")
+        parser.add_argument("--seed", type=int, help="Optional seed for the simulation; disables --map param")
+        
+        args = parser.parse_args()
+        
+        if args.customMap and args.seed:
+            print("Ambiguous call with map and seed - these arguments cannot be used together.")
+            sys.exit(1)
+        
+        print("Scores (P1, P2):", run_simulation(args.bot1, args.bot2, map_file=args.customMap, seed=args.seed))

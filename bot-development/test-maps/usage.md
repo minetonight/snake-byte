@@ -3,6 +3,11 @@ You can place up to 4 snakes per player (8 total lines of 0 and 1). Just draw th
 # Expected score
 Each map defines the final expected score. If out bot(s) dont collect them, the test is a fail.
 
+# subfolders
+The root folder test-maps just checks if the bots survive for 200 turns.
+The tactics subfolder checks for smart bot behaviour.
+Split into two because the ai agent is running tests on all maps which is good and bad.
+
 # LIMITation for equal snakes count
 You must always ensure that both players have the exact same number of snakes on the map.
 
