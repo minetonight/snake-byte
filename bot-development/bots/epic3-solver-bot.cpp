@@ -6,9 +6,31 @@
 #include <queue>
 #include <algorithm>
 #include <fstream>
+#include <unistd.h>
+#include <csignal>
+#include <exception>
 using namespace std;
 using namespace std::chrono;
-ofstream mylog("epic3_bot_log.txt", ios::app);
+
+ofstream make_log_stream() {
+    return ofstream("epic3_bot_log_" + to_string(getpid()) + ".txt", ios::app);
+}
+
+ofstream mylog = make_log_stream();
+
+void crash_signal_handler(int sig) {
+    cerr << "FATAL_SIGNAL " << sig << endl;
+    mylog << "FATAL_SIGNAL " << sig << '\n';
+    mylog.flush();
+    _exit(128 + sig);
+}
+
+void bot_terminate_handler() {
+    cerr << "UNCAUGHT_EXCEPTION" << endl;
+    mylog << "UNCAUGHT_EXCEPTION\n";
+    mylog.flush();
+    abort();
+}
 
 // --- TIME MANAGEMENT ---
 auto turn_start_time = high_resolution_clock::now();
@@ -41,7 +63,7 @@ struct Snake {
     bool is_alive;
     // Circular buffer to hold body coordinates (1D indices).
     // Initialized to max possible length to avoid reallocation.
-    vector<int16_t> body; 
+    vector<int> body; 
 };
 
 inline int ring_size(const Snake& s) {
@@ -574,6 +596,11 @@ void run_local_tests() {
 #endif
 
 int main() {
+    signal(SIGSEGV, crash_signal_handler);
+    signal(SIGABRT, crash_signal_handler);
+    signal(SIGFPE, crash_signal_handler);
+    signal(SIGILL, crash_signal_handler);
+    std::set_terminate(bot_terminate_handler);
 #ifdef LOCAL_TEST
     run_local_tests();
 #endif
@@ -862,7 +889,7 @@ int main() {
 
         auto iter_elapsed = duration_cast<microseconds>(high_resolution_clock::now() - iter_start);
         
-        mylog << "Turn " << counter << " elapsed: " << iter_elapsed.count() << "ys, output: " << output << endl;
+        mylog << "Turn " << counter << " elapsed: " << iter_elapsed.count() << "ys, output: " << output << '\n';
         cout << output << endl;
     }
 }

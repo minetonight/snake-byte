@@ -2,3 +2,7 @@
 /bot-development/bots/output.txt
 /WinterChallenge2026-Exotec/bot_log.txt
 *.log
+.directory
+.vscode/settings.json
+prompts/senior-dev-consultant.md
+prompts/strategic-planner.md
