@@ -2,19 +2,17 @@ import subprocess
 import re
 import os
 
-def run_simulation(bot1_path, bot2_path, map_file=None):
+def run_simulation(bot1_path, bot2_path, map_file=None, seed=None):
     # The directory where pom.xml is located
     winter_challenge_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../WinterChallenge2026-Exotec")
     
     # We pass the paths combined with ||| to handle spaces safely via Maven properties
-     # mvn compile exec:java -Dexec.mainClass=HeadlessMain -Dexec.classpathScope=test -Dexec.args="python3 config/Boss.py|||python3 config/Boss.py" -q 
-        
-
+    # mvn compile exec:java -Dexec.mainClass=HeadlessMain -Dexec.classpathScope=test -Dexec.args="python3 config/Boss.py|||python3 config/Boss.py" -q 
     command = [
         "mvn", "compile", "exec:java", 
         "-Dexec.mainClass=HeadlessMain", 
         "-Dexec.classpathScope=test",
-        f'-Dexec.args="{bot1_path}|||{bot2_path}"',
+        f'-Dexec.args="{bot1_path}|||{bot2_path}|||{seed if seed is not None else ""}"',
     ]
 
     expected_p1 = None
@@ -73,6 +71,7 @@ def run_simulation(bot1_path, bot2_path, map_file=None):
     return p1_score, p2_score
 
 def test_all_maps(bot1, bot2):
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     test_maps_dir = os.path.join(base_dir, '../test-maps')
     
     print(f"--- Running simulations for all maps in {test_maps_dir} ---")
@@ -83,8 +82,7 @@ def test_all_maps(bot1, bot2):
             scores = run_simulation(bot1, bot2, map_file=map_path)
             print(f"Final Scores (P1, P2): {scores}")
 
-
-if __name__ == "__main__":
+def manualCalls():
     # Example usage:
     # Assuming you have two python files in the same directory as this script.
     # Note: Using absolute paths is safer since the working directory during execution is inside the java project.
@@ -113,3 +111,23 @@ if __name__ == "__main__":
     # print("Scores (P1, P2):", run_simulation(bot1, bot2, map_file=my_test_map2))
     # angled_snake_map = os.path.join(base_dir, '../test-maps/test_map_with2-up-angled-snake.txt')
     # print("Scores (P1, P2):", run_simulation(bot1, bot2, map_file=angled_snake_map))
+
+# if __name__ == "__main__":
+#     manualCalls()
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+    parser = argparse.ArgumentParser(description="Run SnakeByte simulation.")
+    parser.add_argument("bot1", help="Command and absolute Path for bot 1")
+    parser.add_argument("bot2", help="Command and absolute Path for bot 2")
+    parser.add_argument("--map", dest="customMap", help="Optional path to custom map file; disables --seed param")
+    parser.add_argument("--seed", type=int, help="Optional seed for the simulation; disables --map param")
+    
+    args = parser.parse_args()
+    
+    if args.customMap and args.seed:
+        print("Ambiguous call with map and seed - these arguments cannot be used together.")
+        sys.exit(1)
+    
+    print("Scores (P1, P2):", run_simulation(args.bot1, args.bot2, map_file=args.customMap, seed=args.seed))
