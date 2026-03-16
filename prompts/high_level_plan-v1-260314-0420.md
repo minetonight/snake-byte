@@ -12,7 +12,7 @@ This plan is language-independent and designed for iterative delivery by an agen
 *Goal: Establish the basic build, execution, and testing environments.*
 * **Epic 1.1: Environment Scaffolding**
   * Set up source control layout and language-appropriate skeletons for engine IO parsing (myId, dimensions, board state, snake commands).
-  * Establish baseline bot implementation answering with valid `id WAIT` or `id UP` commands.
+  * Establish baseline bot implementation answering with valid `WAIT` or `id UP` commands.
 * **Epic 1.2: Scenario Testing Infrastructure**
   * Create a local game engine interface connecting your code with the provided `WinterChallenge2026-Exotec` engine.
   * Define deterministic seed-based test cases (`test-scenarios.txt`) covering basic 1v1 and 2v2 situations (e.g., collision avoidance, climbing platforms, choosing safe food over distant contested food).

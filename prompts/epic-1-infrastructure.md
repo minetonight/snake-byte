@@ -26,7 +26,7 @@ Folder WinterChallenge2026-Exotec contains the game code that we are creating an
 ### Story 1.2: Environment Scaffolding and IO Protocol (C++)
 **As a** C++ bot,
 **I want** to correctly parse the `SnakeByte` game Initialization Input and Turn Input,
-**So that** I can output valid commands (`id WAIT`, `id UP`, `id DOWN`, `id LEFT`, `id RIGHT`) while respecting the 1000ms first-turn and 73ms per-turn rules.
+**So that** I can output valid commands (`WAIT`, `id UP`, `id DOWN`, `id LEFT`, `id RIGHT`) while respecting the 1000ms first-turn and 73ms per-turn rules.
 * **Acceptance Criteria:**
   * Parse Initialization: `myId`, `width` (15-45), `height` (10-30), grid layout (inverted Y: row 0 is top, going UP means decreasing Y), and snakebot IDs.
   * Parse Turn Input: Remaining power sources, number of snakebots, and their 2D body part positions.

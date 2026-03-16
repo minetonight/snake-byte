@@ -48,6 +48,27 @@ inline int ring_size(const Snake& s) {
     return static_cast<int>(s.body.size());
 }
 
+inline int infer_previous_action(const Snake& s) {
+    if (s.length > 1) {
+        int h_pos = s.body[s.head_idx];
+        int n_pos = s.body[(s.head_idx + 1) % ring_size(s)];
+
+        if (h_pos == n_pos - max_width) return 0; // UP
+        if (h_pos == n_pos + max_width) return 1; // DOWN
+        if (h_pos == n_pos - 1) return 2; // LEFT
+        if (h_pos == n_pos + 1) return 3; // RIGHT
+    }
+    return 0; // Default UP for length-1 snake
+}
+
+inline const char* action_to_string(int action) {
+    if (action == 0) return "UP";
+    if (action == 1) return "DOWN";
+    if (action == 2) return "LEFT";
+    if (action == 3) return "RIGHT";
+    return "UP";
+}
+
 struct GameState {
     vector<int16_t> grid;
     vector<Snake> my_snakes;
@@ -734,20 +755,24 @@ int main() {
         
         // 2. Decide actions for each of my snakes independently
         vector<string> action_strs;
-        vector<int> current_my_actions(state.my_snakes.size(), 4); // default WAIT
+        vector<int> current_my_actions(state.my_snakes.size(), 0);
         int dx[] = {0, 0, -1, 1};
         int dy[] = {-1, 1, 0, 0};
         
         for (size_t s_idx = 0; s_idx < state.my_snakes.size(); ++s_idx) {
-            if (out_of_time()) {
-                break;
-            }
             Snake& s = state.my_snakes[s_idx];
             if (!s.is_alive) continue;
             
             int head_pos = s.body[s.head_idx];
-            int best_action = 4; // WAIT
+            int fallback_action = infer_previous_action(s);
+            int best_action = fallback_action;
             int best_score = -999999;
+
+            if (out_of_time()) {
+                current_my_actions[s_idx] = fallback_action;
+                action_strs.push_back(to_string(s.id) + " " + action_to_string(fallback_action));
+                continue;
+            }
             
             // Try all 4 directions (0:UP, 1:DOWN, 2:LEFT, 3:RIGHT)
             for (int a = 0; a < 4; ++a) {
@@ -822,15 +847,9 @@ int main() {
             }
             
             current_my_actions[s_idx] = best_action;
-            
-            string action_name = "WAIT";
-            if (best_action == 0) action_name = "UP";
-            else if (best_action == 1) action_name = "DOWN";
-            else if (best_action == 2) action_name = "LEFT";
-            else if (best_action == 3) action_name = "RIGHT";
-            
+
             // Format ID ACTION
-            action_strs.push_back(to_string(s.id) + " " + action_name);
+            action_strs.push_back(to_string(s.id) + " " + action_to_string(best_action));
         }
         
         // Join actions with semicolons
