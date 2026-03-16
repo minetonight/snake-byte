@@ -31,7 +31,7 @@ Folder WinterChallenge2026-Exotec contains the game code that we are creating an
   * the way to start the maps is
     ```
     cd bot-development/simulation/
-    python3 run_simulation.py "/home/aleks/Development/Python/snake-byte/bot-development/bots/epic3-solver-bot.exe" "python3 /home/aleks/Development/Python/snake-byte/bot-development/bots/Boss.py" --map "/home/aleks/Development/Python/snake-byte/bot-development/test-maps/pathing/01 check graviti short path-right side.txt"
+    python3 run_simulation.py "/home/aleks/Development/Python/snake-byte/bot-development/bots/epic3-solver-bot.exe" "python3 /home/aleks/Development/Python/snake-byte/bot-development/bots/Boss.py" --map "/home/aleks/Development/Python/snake-byte/bot-development/test-maps/pathing/01 check gravity short path-right side.txt"
     ```
   * runtime profiling of the execution tracks the time since the start of the turn and stops searching when we reach 95% of the allotted time of 73ms
 
