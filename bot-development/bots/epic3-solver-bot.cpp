@@ -710,8 +710,6 @@ int main() {
 
         // --- DEBUG Dump Grid State on Turn 1 --- (Removed to save ms)
 
-        auto iter_elapsed = duration_cast<microseconds>(high_resolution_clock::now() - iter_start);
-        
         // --- DECISION LOGIC ---
         
         // 1. Calculate Voronoi board control
@@ -720,6 +718,7 @@ int main() {
         vector<int> powerup_positions;
         powerup_positions.reserve(power_source_count);
         for (int pos = 0; pos < grid_size; ++pos) {
+            if (out_of_time()) break;
             if (state.grid[pos] == CELL_POWERUP) {
                 powerup_positions.push_back(pos);
             }
@@ -740,6 +739,9 @@ int main() {
         int dy[] = {-1, 1, 0, 0};
         
         for (size_t s_idx = 0; s_idx < state.my_snakes.size(); ++s_idx) {
+            if (out_of_time()) {
+                break;
+            }
             Snake& s = state.my_snakes[s_idx];
             if (!s.is_alive) continue;
             
@@ -784,9 +786,10 @@ int main() {
                 }
 
                 // Exclusive / contested heuristic proxy using distances to all heads.
-                if (!powerup_positions.empty()) {
+                if (!powerup_positions.empty() && !out_of_time()) {
                     int best_powerup_eval = -999999;
                     for (int p_pos : powerup_positions) {
+                        if (out_of_time()) break;
                         int my_dist = manhattan(n_pos, p_pos);
                         int opp_best_dist = 999999;
                         for (const auto& opp : state.opp_snakes) {
@@ -837,6 +840,8 @@ int main() {
             if (i < action_strs.size() - 1) output += ";";
         }
         if (output.empty()) output = "WAIT";
+
+        auto iter_elapsed = duration_cast<microseconds>(high_resolution_clock::now() - iter_start);
         
         mylog << "Turn " << counter << " elapsed: " << iter_elapsed.count() << "ys, output: " << output << endl;
         cout << output << endl;
