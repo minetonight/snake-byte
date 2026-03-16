@@ -12,7 +12,7 @@ def run_simulation(bot1_path, bot2_path, map_file=None, seed=None):
         "mvn", "compile", "exec:java", 
         "-Dexec.mainClass=HeadlessMain", 
         "-Dexec.classpathScope=test",
-        f'-Dexec.args="{bot1_path}|||{bot2_path}|||{seed if seed is not None else ""}"',
+        f'-Dexec.args={bot1_path}|||{bot2_path}|||{seed if seed is not None else ""}',
     ]
 
     expected_p1 = None
