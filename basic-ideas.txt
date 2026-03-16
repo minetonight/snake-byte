@@ -256,9 +256,10 @@ What is the move complexity scope for 8 snakes with 3 possible moves each
 
 9) resources and limitations
  - c++ optimization
-   * GCC pragmas and attributes that influence code generation fair game? 
+   * GCC pragmas and attributes that influence code generation are allowed
    * 100000Kb source code limit
    * 768Mb ram
+   * one core but with hyperthreading
    * 73ms effective limit per turn (heuristic test on codingame)
 
 
