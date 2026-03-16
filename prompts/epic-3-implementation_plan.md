@@ -35,7 +35,7 @@ We will create a new bot file `epic3-solver-bot.cpp` taking [epic2-solver-bot.cp
 
 ### Automated Tests
 - Run `run_simulation.py` with custom maps:
-  - [bot-development/test-maps/pathing/01 check graviti short path-right side.txt](file:///home/aleks/Development/Python/snake-byte/bot-development/test-maps/pathing/01%20check%20graviti%20short%20path-right%20side.txt)
-  - `bot-development/test-maps/pathing/01 check graviti short path-left side.txt`
+  - [bot-development/test-maps/pathing/01 check gravity short path-right side.txt](file:///home/aleks/Development/Python/snake-byte/bot-development/test-maps/pathing/01%20check%20gravity%20short%20path-right%20side.txt)
+  - `bot-development/test-maps/pathing/01 check gravity short path-left side.txt`
 - Assert that the snake successfully paths to the goal using gravity.
 - Verify time elapsed logging confirms stops before the 73ms budget.
