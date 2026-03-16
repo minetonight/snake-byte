@@ -8,7 +8,7 @@
 
 ## Resources
 The rules of the game are in the snakebyte-rules.txt. The project overview is in the basic-ideas.txt.
-Consider the other epics in the prompts folder as they give context what was completed and what will be done later.
+Consider the other epics in the prompts folder as they give context what will be done later.
 Folder WinterChallenge2026-Exotec contains the game code that we are creating an AI bot for.
 
 ## Stories for Implementation
