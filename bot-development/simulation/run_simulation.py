@@ -102,6 +102,7 @@ def manualMode():
     
     bot1 = f"{os.path.join(base_dir, '../bots/epic-2-hovering-flying-snakes.exe')}"
     bot1 = f"{os.path.join(base_dir, '../bots/epic2-solver-bot.exe')}"
+    bot1 = f"{os.path.join(base_dir, '../bots/epic3-solver-bot.exe')}"
 
     # bot2 = "../bots/rightBoss.py" 
     # bot2 = "../bots/leftBoss.py" 
@@ -125,6 +126,11 @@ def manualMode():
     # angled_snake_map = os.path.join(base_dir, '../test-maps/test_map_with2-up-angled-snake.txt')
     # print("Scores (P1, P2):", run_simulation(bot1, bot2, map_file=angled_snake_map))
 
+"""
+usage
+$ cd bot-development/simulation/
+$ python3 run_simulation.py "/home/aleks/Development/Python/snake-byte/bot-development/your_new_bot.exe" "python3 /home/aleks/Development/Python/snake-byte/bot-development/bots/Boss.py" --map /home/aleks/Development/Python/snake-byte/bot-development/test-maps/test_map_with2-eating.txt
+"""
 if __name__ == "__main__":
     import argparse
     import sys
