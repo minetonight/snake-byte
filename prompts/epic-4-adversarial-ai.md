@@ -16,7 +16,7 @@ Folder WinterChallenge2026-Exotec contains the game code that we are creating an
 **So that** my snakes do not stumble into predictable ambushes without forcing the engine to calculate perfect deep game trees.
 * **Acceptance Criteria:**
   * TDD: create test cases in a new folder test-maps/enemies/ following the ideas of the exiting test cases. make test situations that must be completed by this implementation. tests first, and not edited, code later. when a test must be changed, ask the user for confirmation, stop your flow.  
-  * Implement a 1d represenatation of a 2D array representation (`danger_map`) that projects potential enemy movement out 1-2 turns.
+  * Implement a 1d representation of a 2D array representation (`danger_map`) that projects potential enemy movement out 1-2 turns.
   * Mask out cells probabilistically based on "path count" (i.e. cells with 6 converging enemy paths are exceptionally more dangerous than cells with 1 path).
   * Exclude these high-risk tiles entirely from standard friendly A* pathfinding unless chasing an explicitly enforced critical objective.
 

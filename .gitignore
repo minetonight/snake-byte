@@ -6,3 +6,5 @@
 .vscode/settings.json
 prompts/senior-dev-consultant.md
 prompts/strategic-planner.md
+*/__pycache__/*.pyc
+run*asan.sh

@@ -1,0 +1,1757 @@
+#include <iostream>
+#include <string>
+#include <vector>
+#include <chrono>
+#include <thread>
+#include <queue>
+#include <algorithm>
+#include <fstream>
+#include <unistd.h>
+#include <csignal>
+#include <exception>
+#include <cstdint>
+using namespace std;
+using namespace std::chrono;
+
+ofstream make_log_stream() {
+    return ofstream("epic3_bot_log_" + to_string(getpid()) + ".txt", ios::app);
+}
+
+ofstream mylog = make_log_stream();
+
+void crash_signal_handler(int sig) {
+    cerr << "FATAL_SIGNAL " << sig << endl;
+    mylog << "FATAL_SIGNAL " << sig << '\n';
+    mylog.flush();
+    _exit(128 + sig);
+}
+
+void bot_terminate_handler() {
+    cerr << "UNCAUGHT_EXCEPTION" << endl;
+    mylog << "UNCAUGHT_EXCEPTION\n";
+    mylog.flush();
+    abort();
+}
+
+// --- TIME MANAGEMENT ---
+auto turn_start_time = high_resolution_clock::now();
+bool out_of_time() {
+    auto now = high_resolution_clock::now();
+    auto ms_passed = duration_cast<milliseconds>(now - turn_start_time).count();
+    return ms_passed >= 69; // ~95% of 73ms budget
+}
+
+// --- CONSTANTS ---
+constexpr int16_t CELL_WALL = -1;
+constexpr int16_t CELL_EMPTY = 0;
+constexpr int16_t CELL_POWERUP = 3;
+constexpr int16_t CELL_SNAKE_BASE = 10; // Snake IDs are 10 + id
+
+// --- DYNAMIC DIMENSIONS ---
+int world_width;
+int world_height;
+int total_powerups_count;
+int max_len;
+int max_width;
+int max_height;
+int grid_size;
+bool map_has_open_left_edge = false;
+bool map_has_open_right_edge = false;
+bool map_has_open_floor_edge = false;
+
+struct Snake {
+    int id;
+    int length;
+    int head_idx;
+    int tail_idx;
+    bool is_alive;
+    // Circular buffer to hold body coordinates (1D indices).
+    // Initialized to max possible length to avoid reallocation.
+    vector<int> body; 
+};
+
+inline int ring_size(const Snake& s) {
+    return static_cast<int>(s.body.size());
+}
+
+inline int infer_previous_action(const Snake& s) {
+    if (s.length > 1) {
+        int h_pos = s.body[s.head_idx];
+        int n_pos = s.body[(s.head_idx + 1) % ring_size(s)];
+
+        if (h_pos == n_pos - max_width) return 0; // UP
+        if (h_pos == n_pos + max_width) return 1; // DOWN
+        if (h_pos == n_pos - 1) return 2; // LEFT
+        if (h_pos == n_pos + 1) return 3; // RIGHT
+    }
+    return 0; // Default UP for length-1 snake
+}
+
+inline const char* action_to_string(int action) {
+    if (action == 0) return "UP";
+    if (action == 1) return "DOWN";
+    if (action == 2) return "LEFT";
+    if (action == 3) return "RIGHT";
+    return "UP";
+}
+
+inline int opposite_action(int action) {
+    if (action == 0) return 1;
+    if (action == 1) return 0;
+    if (action == 2) return 3;
+    if (action == 3) return 2;
+    return action;
+}
+
+inline bool is_backward_action(const Snake& s, int action) {
+    if (s.length <= 1) return false;
+    return action == opposite_action(infer_previous_action(s));
+}
+
+struct GameState {
+    vector<int16_t> grid;
+    vector<Snake> my_snakes;
+    vector<Snake> opp_snakes;
+
+    // --- PHYSICS ENGINE ---
+    
+    // Check if a single cell touches the ground or another grounded element
+    inline bool is_cell_grounded(int pos, const vector<bool>& grounded_snakes) const {
+        int below_idx = pos + max_width; // Y+1
+        if (below_idx >= grid_size) return true; // Safety floor
+        
+        int16_t below_cell = grid[below_idx];
+        if (below_cell == CELL_WALL || below_cell == CELL_POWERUP) return true;
+        
+        if (below_cell >= CELL_SNAKE_BASE) {
+            int snake_id = below_cell - CELL_SNAKE_BASE;
+            // Java Engine strictly prevents a bird from supporting ITSELF in mid-air
+            // A snake cannot be physically grounded by resting on its own tail
+            if (grounded_snakes[snake_id]) return true;
+        }
+        return false;
+    }
+
+    inline void apply_gravity() {
+        bool something_fell = true;
+        
+        // Use an array indexed by snake ID to track grounded states efficiently.
+        // Assuming max snake ID is ~2000 per engine. 
+        // We can just size it based on max possible ID.
+        // For codingame we can use a small map or assume max IDs < 10000.
+        // To be safe and fast, evaluate grounding iteratively over the live snakes vector.
+        
+        int infinite_loop_guard = 0;
+        int airborne_debug_size = 0;
+        while (something_fell) {
+            infinite_loop_guard++;
+            if (infinite_loop_guard > 50) {
+                cerr << "INFINITE LOOP DETECTED IN GRAVITY! airborne size=" << airborne_debug_size << endl;
+                break;
+            }
+            something_fell = false;
+            
+            // Gather all live airborne snakes
+            vector<Snake*> airborne;
+            for (auto& s : my_snakes) if (s.is_alive) airborne.push_back(&s);
+            for (auto& s : opp_snakes) if (s.is_alive) airborne.push_back(&s);
+            airborne_debug_size = airborne.size();
+            
+            vector<bool> grounded(10000, false); // Quick lookup for grounded IDs
+            bool something_got_grounded = true;
+            
+            // 1. Resolve Transitive Grounding (Identical to Java engine)
+            while (something_got_grounded) {
+                something_got_grounded = false;
+                
+                for (auto it = airborne.begin(); it != airborne.end();) {
+                    Snake* s = *it;
+                    bool is_s_grounded = false;
+                    for (int i = 0; i < s->length; ++i) {
+                        int pos = s->body[(s->head_idx + i) % ring_size(*s)];
+                        if (is_cell_grounded(pos, grounded)) {
+                            is_s_grounded = true;
+                            break;
+                        }
+                    }
+                    
+                    if (is_s_grounded) {
+                        grounded[s->id] = true;
+                        something_got_grounded = true;
+                        // Remove from airborne
+                        it = airborne.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+            
+            // 2. Erase grid representation of airborne snakes before moving them
+            // This prevents them from tripping over each other's old positions as they fall simultaneously
+            for (Snake* s : airborne) {
+                for (int i = 0; i < s->length; ++i) {
+                    int pos = s->body[(s->head_idx + i) % ring_size(*s)];
+                    if (pos < grid_size) {
+                        grid[pos] = CELL_EMPTY;
+                    }
+                }
+            }
+            
+            // 3. Fall all airborne snakes uniformly
+            for (Snake* s : airborne) {
+                something_fell = true;
+                
+                // Shift all body parts down
+                for (int i = 0; i < s->length; ++i) {
+                    int b_idx = (s->head_idx + i) % ring_size(*s);
+                    s->body[b_idx] += max_width; 
+                }
+                
+                // Java Out-of-bounds parity: ONLY kill if ALL parts are off the bottom of the map
+                // In Java: bird.body.stream().allMatch(part -> part.getY() >= grid.height + 1)
+                // In our physics: mapped `world_height` starts at Y=`max_len`. 
+                // Bottom of world is `max_len + world_height`. Java checks >= height + 1 (meaning fully off).
+                // Translating: Y >= max_len + world_height + 1. Which simplifies to Y >= max_height - max_len + 1.
+                bool all_out = true;
+                for (int i = 0; i < s->length; ++i) {
+                    int pos = s->body[(s->head_idx + i) % ring_size(*s)];
+                    int y = pos / max_width;
+                    if (y < max_len + world_height + 1) { // 1 padding row below map is valid
+                        all_out = false;
+                        break;
+                    }
+                }
+                
+                if (all_out) {
+                    s->is_alive = false;
+                }
+            }
+            
+            // 4. Restamp living airborne snakes back to grid
+            for (Snake* s : airborne) {
+                if (s->is_alive) {
+                    for (int i = 0; i < s->length; ++i) {
+                        int pos = s->body[(s->head_idx + i) % ring_size(*s)];
+                        if (pos < grid_size) {
+                            grid[pos] = CELL_SNAKE_BASE + s->id;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // 0: UP, 1: DOWN, 2: LEFT, 3: RIGHT, 4: WAIT
+    inline void apply_movement(const vector<int>& my_actions, const vector<int>& opp_actions) {
+        auto move_snakes = [&](vector<Snake>& snakes, const vector<int>& actions) {
+            for (size_t i = 0; i < snakes.size(); ++i) {
+                Snake& s = snakes[i];
+                if (!s.is_alive) continue;
+                
+                int action = actions[i];
+                if (action == 4) { // WAIT: maintain previous direction
+                    // Direction is inferred from difference between head and neck
+                    if (s.length > 1) {
+                        int h_pos = s.body[s.head_idx];
+                        int n_pos = s.body[(s.head_idx + 1) % ring_size(s)];
+                        
+                        if (h_pos == n_pos - max_width) action = 0; // UP
+                        else if (h_pos == n_pos + max_width) action = 1; // DOWN
+                        else if (h_pos == n_pos - 1) action = 2; // LEFT
+                        else if (h_pos == n_pos + 1) action = 3; // RIGHT
+                    } else {
+                        action = 0; // Default UP if length 1 and WAIT
+                    }
+                }
+                
+                int h_pos = s.body[s.head_idx];
+                int hx = h_pos % max_width;
+                int hy = h_pos / max_width;
+                
+                int n_hx = hx;
+                int n_hy = hy;
+                
+                if (action == 0) n_hy -= 1; // UP
+                else if (action == 1) n_hy += 1; // DOWN
+                else if (action == 2) n_hx -= 1; // LEFT
+                else if (action == 3) n_hx += 1; // RIGHT
+                
+                // Note: Snake can legally go out of bounds UP/LEFT/RIGHT, 
+                // but gravity handles out of bounds DOWN. 
+                // Bounds enforcement technically just destroys the snake if it hits grid borders 
+                // since they are padded with enough empty space to not happen legally.
+                
+                int n_pos = n_hy * max_width + n_hx;
+                
+                int tail_pos = s.body[s.tail_idx];
+                
+                // Shift head pointer backward (circularly)
+                int new_head_idx = (s.head_idx - 1 + ring_size(s)) % ring_size(s);
+                s.body[new_head_idx] = n_pos; // Set new head here
+                
+                // Shift tail pointer backward (effectively cutting off old tail)
+                s.tail_idx = (s.tail_idx - 1 + ring_size(s)) % ring_size(s);
+                s.head_idx = new_head_idx;
+                
+                // Update grid: remove old tail, place new head
+                // Wait on updating new head because of collisions and powerups!
+                // For now, only remove tail from grid to clear it for others moves
+                grid[tail_pos] = CELL_EMPTY;
+            }
+        };
+        
+        move_snakes(my_snakes, my_actions);
+        move_snakes(opp_snakes, opp_actions);
+    }
+
+    // Helper function to resolve collisions and powerups
+    inline void resolve_collisions() {
+        // "These collisions are resolved simultaneously for all snakebots."
+        
+        // 1. Gather all new head positions
+        vector<Snake*> all_snakes;
+        for (auto& s : my_snakes) if (s.is_alive) all_snakes.push_back(&s);
+        for (auto& s : opp_snakes) if (s.is_alive) all_snakes.push_back(&s);
+        
+        vector<int> head_positions(all_snakes.size());
+        vector<bool> to_destroy(all_snakes.size(), false);
+        vector<bool> ate_powerup(all_snakes.size(), false);
+        
+        for (size_t i = 0; i < all_snakes.size(); ++i) {
+            head_positions[i] = all_snakes[i]->body[all_snakes[i]->head_idx];
+        }
+        
+        // 2. Check what each head landed on
+        for (size_t i = 0; i < all_snakes.size(); ++i) {
+            Snake* s = all_snakes[i];
+            int h_pos = head_positions[i];
+            
+            // Check grid bounds death (safety)
+            if (h_pos < 0 || h_pos >= grid_size) {
+                to_destroy[i] = true;
+                continue;
+            }
+            
+            int cell_val = grid[h_pos];
+            if (cell_val == CELL_WALL || cell_val >= CELL_SNAKE_BASE) {
+                // Hit wall or body
+                to_destroy[i] = true;
+            } else if (cell_val == CELL_POWERUP) {
+                ate_powerup[i] = true;
+            }
+            
+            // Head-to-Head collisions on empty or powerup cells
+            for (size_t j = i + 1; j < all_snakes.size(); ++j) {
+                if (head_positions[i] == head_positions[j]) {
+                    to_destroy[i] = true;
+                    to_destroy[j] = true;
+                    // BUT if it's a powerup:
+                    // "If multiple snakebot heads collide on a cell containing a power source, 
+                    // that power source is considered eaten by each of those snakebots!
+                    // In the same turn each snake receives +1 size... but loses -1 size by being beheaded."
+                    // -> Handled by setting BOTH ate_powerup and to_destroy to true!
+                }
+            }
+        }
+        
+        // 3. Apply Destruction and Growth
+        for (size_t i = 0; i < all_snakes.size(); ++i) {
+            Snake* s = all_snakes[i];
+            
+            if (ate_powerup[i]) {
+                // Grow: The tail does not move this turn (we basically revert the tail cut)
+                // wait, we already cut the tail in movement phase, so to grow we just add a tail segment back
+                // To do this simply: shift tail_idx forward
+                s->tail_idx = (s->tail_idx + 1) % ring_size(*s);
+                s->length++;
+                // We'll restamp the tail underneath
+            }
+            
+            if (to_destroy[i]) {
+                // Head is destroyed
+                s->length--;
+                // New head is the next segment
+                s->head_idx = (s->head_idx + 1) % ring_size(*s);
+                
+                if (s->length < 3) {
+                    s->is_alive = false;
+                    // Clear entirely from grid
+                    for (int k = 0; k < s->length; ++k) {
+                        int b_idx = (s->head_idx + k) % ring_size(*s);
+                        grid[s->body[b_idx]] = CELL_EMPTY;
+                    }
+                }
+            }
+        }
+        
+        // 4. Clear consumed powerups
+        for (size_t i = 0; i < all_snakes.size(); ++i) {
+            if (ate_powerup[i]) {
+                grid[head_positions[i]] = CELL_EMPTY;
+            }
+        }
+        
+        // 5. Restamp all living snake bodies to grid
+        for (auto* s : all_snakes) {
+            if (!s->is_alive) continue;
+            for (int k = 0; k < s->length; ++k) {
+                int b_idx = (s->head_idx + k) % ring_size(*s);
+                grid[s->body[b_idx]] = CELL_SNAKE_BASE + s->id;
+            }
+        }
+    }
+    
+    // Simulates one entire turn
+    inline void simulate(const vector<int>& my_actions, const vector<int>& opp_actions) {
+        apply_movement(my_actions, opp_actions);
+        apply_gravity();
+        resolve_collisions();
+    }
+    
+    // --- EVALUATION ENGINE ---
+    
+    struct VoronoiResult {
+        int my_exclusive_powerups = 0; 
+        int opp_exclusive_powerups = 0;
+        int contested_powerups = 0;
+        int length_delta = 0; // expected length advantage
+    };
+
+    VoronoiResult calculate_voronoi() const {
+        VoronoiResult result;
+        
+        // Single BFS queue doing multi-source expansion.
+        // Format: {distance, {player (0=me, 1=opp), pos}}
+        queue<pair<int, pair<int, int>>> q;
+        
+        // Track distances per player. We don't need a massive array per player, 
+        // just an array tracking the shortest distance and who reached it.
+        // grid_size array where value is:
+        //  Lower 16 bits = min distance
+        //  Upper 16 bits = owner (0 = me, 1 = opp, 2 = contested)
+        vector<uint32_t> visited(grid_size, 0xFFFFFFFF);
+        
+        // Push all heads
+        for (const auto& s : my_snakes) {
+            if (!s.is_alive) continue;
+            int h_pos = s.body[s.head_idx];
+            q.push({0, {0, h_pos}});
+            visited[h_pos] = 0; // Dist 0, Player 0
+        }
+        for (const auto& s : opp_snakes) {
+            if (!s.is_alive) continue;
+            int h_pos = s.body[s.head_idx];
+            q.push({0, {1, h_pos}});
+            visited[h_pos] = (1 << 16) | 0; // Dist 0, Player 1
+        }
+        
+        // standard 4-way movement
+        int dx[] = {0, 0, -1, 1};
+        int dy[] = {-1, 1, 0, 0};
+        
+        while (!q.empty()) {
+            if (out_of_time()) break;
+            
+            auto curr = q.front();
+            q.pop();
+            
+            int dist = curr.first;
+            int player = curr.second.first;
+            int pos = curr.second.second;
+            
+            int cx = pos % max_width;
+            int cy = pos / max_width;
+            
+            for (int i = 0; i < 4; ++i) {
+                int nx = cx + dx[i];
+                int ny = cy + dy[i];
+                int n_pos = ny * max_width + nx;
+                
+                if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
+                
+                // Solid cells block BFS in SnakeByte except for Powerups
+                int16_t cell = grid[n_pos];
+                if (cell == CELL_WALL || cell >= CELL_SNAKE_BASE) continue;
+                
+                int new_dist = dist + 1;
+                uint32_t existing = visited[n_pos];
+                uint32_t ex_dist = existing & 0xFFFF;
+                uint32_t ex_player = existing >> 16;
+                
+                if (new_dist < ex_dist) {
+                    visited[n_pos] = (player << 16) | new_dist;
+                    q.push({new_dist, {player, n_pos}});
+                    
+                    if (cell == CELL_POWERUP) {
+                        if (player == 0) {
+                            result.my_exclusive_powerups++;
+                            result.length_delta++;
+                        } else {
+                            result.opp_exclusive_powerups++;
+                            result.length_delta--;
+                        }
+                    }
+                } else if (new_dist == ex_dist && ex_player != player && ex_player != 2) {
+                    // Contested
+                    visited[n_pos] = (2 << 16) | new_dist;
+                    if (cell == CELL_POWERUP) {
+                        // It was strictly given to whoever got here first in the queue.
+                        // We need to undo their exclusive point and mark it contested.
+                        if (ex_player == 0) {
+                            result.my_exclusive_powerups--;
+                            result.length_delta--;
+                        } else {
+                            result.opp_exclusive_powerups--;
+                            result.length_delta++;
+                        }
+                        result.contested_powerups++;
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    // --- DECISION HEURISTICS ---
+
+    // Flood fill to determine if moving to a specific start_pos leaves enough room
+    // for `required_space` (usually length / 2 or full length).
+    // Accounts for gravity: space must be accessible via legal moves including falling.
+    bool survives_flood_fill(int start_pos, int required_space) const {
+        if (required_space <= 1) return true; // trivial
+
+        vector<bool> visited(grid_size, false);
+        queue<int> q;
+        q.push(start_pos);
+        visited[start_pos] = true;
+
+        int space_found = 1;
+
+        int dx[] = {0, 0, -1, 1};
+        int dy[] = {-1, 1, 0, 0};
+
+        while (!q.empty()) {
+            if (out_of_time()) return true; // Optimistic return if out of time
+            
+            int pos = q.front();
+            q.pop();
+
+            int cx = pos % max_width;
+            int cy = pos / max_width;
+
+            for (int i = 0; i < 4; ++i) {
+                int nx = cx + dx[i];
+                int ny = cy + dy[i];
+                int n_pos = ny * max_width + nx;
+
+                if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
+                
+                int16_t cell = grid[n_pos];
+                // Can move into empty or powerup
+                if (cell != CELL_EMPTY && cell != CELL_POWERUP) continue;
+
+                if (!visited[n_pos]) {
+                    visited[n_pos] = true;
+                    space_found++;
+                    if (space_found >= required_space) return true;
+                    q.push(n_pos);
+                    // Note: This basic flood fill doesn't perfectly model gravity during the fill itself,
+                    // but it approximates if the general area has enough raw volume disconnected by walls/bodies.
+                }
+            }
+        }
+        return space_found >= required_space;
+    }
+
+    const Snake* find_my_snake_by_id(int snake_id) const {
+        for (const auto& s : my_snakes) {
+            if (s.id == snake_id) {
+                return &s;
+            }
+        }
+        return nullptr;
+    }
+
+    const Snake* find_opp_snake_by_id(int snake_id) const {
+        for (const auto& s : opp_snakes) {
+            if (s.id == snake_id) {
+                return &s;
+            }
+        }
+        return nullptr;
+    }
+
+    bool has_adjacent_powerup(int head_pos) const {
+        int hx = head_pos % max_width;
+        int hy = head_pos / max_width;
+        int dx[] = {0, 0, -1, 1};
+        int dy[] = {-1, 1, 0, 0};
+
+        for (int i = 0; i < 4; ++i) {
+            int nx = hx + dx[i];
+            int ny = hy + dy[i];
+            if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
+            if (grid[ny * max_width + nx] == CELL_POWERUP) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    int count_safe_followups(const Snake& s) const {
+        if (!s.is_alive || s.length <= 0) return 0;
+
+        int head_pos = s.body[s.head_idx];
+        int hx = head_pos % max_width;
+        int hy = head_pos / max_width;
+        int safe_count = 0;
+        int dx[] = {0, 0, -1, 1};
+        int dy[] = {-1, 1, 0, 0};
+
+        for (int a = 0; a < 4; ++a) {
+            if (is_backward_action(s, a)) continue;
+            int nx = hx + dx[a];
+            int ny = hy + dy[a];
+            if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
+
+            int n_pos = ny * max_width + nx;
+            int16_t next_cell = grid[n_pos];
+            if (next_cell == CELL_WALL || next_cell >= CELL_SNAKE_BASE) continue;
+
+            if (survives_flood_fill(n_pos, max(2, s.length / 2))) {
+                safe_count++;
+            }
+        }
+
+        return safe_count;
+    }
+};
+
+static vector<int> infer_default_actions(const vector<Snake>& snakes) {
+    vector<int> actions(snakes.size(), 0);
+    for (size_t i = 0; i < snakes.size(); ++i) {
+        actions[i] = infer_previous_action(snakes[i]);
+    }
+    return actions;
+}
+
+static int find_my_snake_index(const GameState& state, int snake_id) {
+    for (size_t i = 0; i < state.my_snakes.size(); ++i) {
+        if (state.my_snakes[i].id == snake_id) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+static int find_opp_snake_index(const GameState& state, int snake_id) {
+    for (size_t i = 0; i < state.opp_snakes.size(); ++i) {
+        if (state.opp_snakes[i].id == snake_id) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+struct DangerMapResult {
+    vector<uint16_t> danger_map;
+    int high_risk_threshold = 2;
+};
+
+enum class SnakeRole {
+    Collector = 0,
+    Support = 1,
+    Defender = 2,
+    Suffocator = 3,
+    Killer = 4
+};
+
+static DangerMapResult build_enemy_danger_map(const GameState& state, int projection_depth) {
+    DangerMapResult result;
+    result.danger_map.assign(grid_size, 0);
+
+    int dx[] = {0, 0, -1, 1};
+    int dy[] = {-1, 1, 0, 0};
+
+    for (const auto& opp : state.opp_snakes) {
+        if (!opp.is_alive || opp.length <= 0) continue;
+
+        int start = opp.body[opp.head_idx];
+        if (start < 0 || start >= grid_size) continue;
+        result.danger_map[start] += static_cast<uint16_t>(projection_depth + 1);
+
+        vector<int16_t> best_depth(grid_size, -1);
+        queue<pair<int, int>> q;
+        q.push({start, 0});
+        best_depth[start] = 0;
+
+        while (!q.empty()) {
+            if (out_of_time()) return result;
+
+            auto curr = q.front();
+            q.pop();
+            int pos = curr.first;
+            int depth = curr.second;
+
+            if (depth >= projection_depth) continue;
+
+            int cx = pos % max_width;
+            int cy = pos / max_width;
+
+            for (int i = 0; i < 4; ++i) {
+                int nx = cx + dx[i];
+                int ny = cy + dy[i];
+                if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
+
+                int n_pos = ny * max_width + nx;
+                int16_t cell = state.grid[n_pos];
+                if (cell == CELL_WALL || cell >= CELL_SNAKE_BASE) continue;
+
+                int nd = depth + 1;
+                if (best_depth[n_pos] != -1 && best_depth[n_pos] <= nd) continue;
+                best_depth[n_pos] = static_cast<int16_t>(nd);
+
+                result.danger_map[n_pos] += static_cast<uint16_t>(projection_depth + 1 - nd);
+                q.push({n_pos, nd});
+            }
+        }
+    }
+
+    return result;
+}
+
+static vector<SnakeRole> assign_dynamic_roles(const GameState& state, const vector<int>& powerup_positions, int turn_counter) {
+    vector<SnakeRole> roles(state.my_snakes.size(), SnakeRole::Defender);
+
+    auto manhattan = [](int p1, int p2) {
+        int x1 = p1 % max_width;
+        int y1 = p1 / max_width;
+        int x2 = p2 % max_width;
+        int y2 = p2 / max_width;
+        return abs(x1 - x2) + abs(y1 - y2);
+    };
+
+    for (size_t i = 0; i < state.my_snakes.size(); ++i) {
+        const Snake& s = state.my_snakes[i];
+        if (!s.is_alive || s.length <= 0) continue;
+
+        int head = s.body[s.head_idx];
+        int nearest_power = 999999;
+        for (int p : powerup_positions) nearest_power = min(nearest_power, manhattan(head, p));
+
+        int nearest_enemy = 999999;
+        int nearest_short_enemy = 999999;
+        for (const auto& opp : state.opp_snakes) {
+            if (!opp.is_alive || opp.length <= 0) continue;
+            int d = manhattan(head, opp.body[opp.head_idx]);
+            nearest_enemy = min(nearest_enemy, d);
+            if (opp.length <= 3) nearest_short_enemy = min(nearest_short_enemy, d);
+        }
+
+        int nearest_ally = 999999;
+        for (size_t j = 0; j < state.my_snakes.size(); ++j) {
+            if (i == j) continue;
+            const Snake& ally = state.my_snakes[j];
+            if (!ally.is_alive || ally.length <= 0) continue;
+            nearest_ally = min(nearest_ally, manhattan(head, ally.body[ally.head_idx]));
+        }
+
+        SnakeRole role = SnakeRole::Defender;
+        if (nearest_short_enemy <= 6) {
+            role = SnakeRole::Killer;
+        } else if (nearest_enemy <= 3) {
+            role = SnakeRole::Suffocator;
+        } else if (nearest_power <= 5) {
+            role = SnakeRole::Collector;
+        } else if (state.my_snakes.size() > 1 && nearest_ally <= 4) {
+            role = SnakeRole::Support;
+        }
+
+        if (role == SnakeRole::Defender && state.my_snakes.size() > 1 && ((turn_counter + static_cast<int>(i)) & 1)) {
+            role = SnakeRole::Support;
+        }
+
+        roles[i] = role;
+    }
+
+    return roles;
+}
+
+static int evaluate_local_combat(
+    const GameState& state,
+    int my_snake_id,
+    int opp_snake_id,
+    int root_my_length,
+    int root_opp_length
+) {
+    const Snake* self = state.find_my_snake_by_id(my_snake_id);
+    const Snake* opp = state.find_opp_snake_by_id(opp_snake_id);
+
+    if (self == nullptr || !self->is_alive) return -70000;
+    if (opp == nullptr || !opp->is_alive) return 70000;
+
+    int score = 0;
+    score += (self->length - opp->length) * 140;
+
+    int my_lost = max(0, root_my_length - self->length);
+    int opp_lost = max(0, root_opp_length - opp->length);
+    score -= my_lost * 220;
+    score += opp_lost * 220;
+
+    int my_head = self->body[self->head_idx];
+    int opp_head = opp->body[opp->head_idx];
+    int my_hx = my_head % max_width;
+    int my_hy = my_head / max_width;
+    int opp_hx = opp_head % max_width;
+    int opp_hy = opp_head / max_width;
+    int hdist = abs(my_hx - opp_hx) + abs(my_hy - opp_hy);
+
+    if (hdist <= 1) score += 500;
+    score -= hdist * 20;
+
+    return score;
+}
+
+static int local_alpha_beta_value(
+    const GameState& state,
+    int my_snake_id,
+    int opp_snake_id,
+    int root_my_length,
+    int root_opp_length,
+    int depth,
+    int alpha,
+    int beta
+) {
+    if (out_of_time() || depth <= 0) {
+        return evaluate_local_combat(state, my_snake_id, opp_snake_id, root_my_length, root_opp_length);
+    }
+
+    const Snake* self = state.find_my_snake_by_id(my_snake_id);
+    const Snake* opp = state.find_opp_snake_by_id(opp_snake_id);
+    if (self == nullptr || opp == nullptr || !self->is_alive || !opp->is_alive) {
+        return evaluate_local_combat(state, my_snake_id, opp_snake_id, root_my_length, root_opp_length);
+    }
+
+    int my_idx = find_my_snake_index(state, my_snake_id);
+    int opp_idx = find_opp_snake_index(state, opp_snake_id);
+    if (my_idx == -1 || opp_idx == -1) {
+        return evaluate_local_combat(state, my_snake_id, opp_snake_id, root_my_length, root_opp_length);
+    }
+
+    vector<int> default_my_actions = infer_default_actions(state.my_snakes);
+    vector<int> default_opp_actions = infer_default_actions(state.opp_snakes);
+
+    int best = -999999;
+    int dx[] = {0, 0, -1, 1};
+    int dy[] = {-1, 1, 0, 0};
+
+    int self_head = self->body[self->head_idx];
+    int sx = self_head % max_width;
+    int sy = self_head / max_width;
+
+    for (int my_a = 0; my_a < 4; ++my_a) {
+        if (is_backward_action(*self, my_a)) continue;
+
+        int mnx = sx + dx[my_a];
+        int mny = sy + dy[my_a];
+        if (mnx < 0 || mnx >= max_width || mny < 0 || mny >= max_height) continue;
+        int my_npos = mny * max_width + mnx;
+        int16_t my_cell = state.grid[my_npos];
+        if (my_cell == CELL_WALL || my_cell >= CELL_SNAKE_BASE) continue;
+
+        int worst = 999999;
+
+        int opp_head = opp->body[opp->head_idx];
+        int ox = opp_head % max_width;
+        int oy = opp_head / max_width;
+
+        for (int opp_a = 0; opp_a < 4; ++opp_a) {
+            if (out_of_time()) break;
+            if (is_backward_action(*opp, opp_a)) continue;
+
+            int onx = ox + dx[opp_a];
+            int ony = oy + dy[opp_a];
+            if (onx < 0 || onx >= max_width || ony < 0 || ony >= max_height) continue;
+            int opp_npos = ony * max_width + onx;
+            int16_t opp_cell = state.grid[opp_npos];
+            if (opp_cell == CELL_WALL || opp_cell >= CELL_SNAKE_BASE) continue;
+
+            GameState next_state = state;
+            vector<int> sim_my_actions = default_my_actions;
+            vector<int> sim_opp_actions = default_opp_actions;
+            sim_my_actions[my_idx] = my_a;
+            sim_opp_actions[opp_idx] = opp_a;
+            next_state.simulate(sim_my_actions, sim_opp_actions);
+
+            int value = local_alpha_beta_value(
+                next_state,
+                my_snake_id,
+                opp_snake_id,
+                root_my_length,
+                root_opp_length,
+                depth - 1,
+                alpha,
+                beta
+            );
+            worst = min(worst, value);
+            beta = min(beta, worst);
+            if (beta <= alpha) break;
+        }
+
+        if (worst == 999999) {
+            GameState next_state = state;
+            vector<int> sim_my_actions = default_my_actions;
+            vector<int> sim_opp_actions = default_opp_actions;
+            sim_my_actions[my_idx] = my_a;
+            next_state.simulate(sim_my_actions, sim_opp_actions);
+            worst = evaluate_local_combat(next_state, my_snake_id, opp_snake_id, root_my_length, root_opp_length);
+        }
+
+        best = max(best, worst);
+        alpha = max(alpha, best);
+        if (beta <= alpha) break;
+    }
+
+    if (best == -999999) {
+        return evaluate_local_combat(state, my_snake_id, opp_snake_id, root_my_length, root_opp_length);
+    }
+
+    return best;
+}
+
+static int choose_local_alpha_beta_action(const GameState& state, int my_snake_id, int depth) {
+    const Snake* self = state.find_my_snake_by_id(my_snake_id);
+    if (self == nullptr || !self->is_alive) return -1;
+    if (state.opp_snakes.empty()) return -1;
+
+    int my_head = self->body[self->head_idx];
+    int my_hx = my_head % max_width;
+    int my_hy = my_head / max_width;
+
+    int target_opp_id = state.opp_snakes[0].id;
+    int best_opp_dist = 999999;
+    for (const auto& opp : state.opp_snakes) {
+        if (!opp.is_alive) continue;
+        int opp_head = opp.body[opp.head_idx];
+        int d = abs(my_hx - (opp_head % max_width)) + abs(my_hy - (opp_head / max_width));
+        if (d < best_opp_dist) {
+            best_opp_dist = d;
+            target_opp_id = opp.id;
+        }
+    }
+
+    const Snake* target_opp = state.find_opp_snake_by_id(target_opp_id);
+    if (target_opp == nullptr || !target_opp->is_alive) return -1;
+
+    int my_idx = find_my_snake_index(state, my_snake_id);
+    if (my_idx == -1) return -1;
+
+    vector<int> default_my_actions = infer_default_actions(state.my_snakes);
+    vector<int> default_opp_actions = infer_default_actions(state.opp_snakes);
+    int opp_idx = find_opp_snake_index(state, target_opp_id);
+    if (opp_idx == -1) return -1;
+
+    int best_action = -1;
+    int best_value = -999999;
+
+    int dx[] = {0, 0, -1, 1};
+    int dy[] = {-1, 1, 0, 0};
+    int sx = my_hx;
+    int sy = my_hy;
+
+    for (int a = 0; a < 4; ++a) {
+        if (out_of_time()) break;
+        if (is_backward_action(*self, a)) continue;
+
+        int nx = sx + dx[a];
+        int ny = sy + dy[a];
+        if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
+        int n_pos = ny * max_width + nx;
+        int16_t next_cell = state.grid[n_pos];
+        if (next_cell == CELL_WALL || next_cell >= CELL_SNAKE_BASE) continue;
+
+        int value = -999999;
+        int worst = 999999;
+
+        int ox = target_opp->body[target_opp->head_idx] % max_width;
+        int oy = target_opp->body[target_opp->head_idx] / max_width;
+
+        for (int opp_a = 0; opp_a < 4; ++opp_a) {
+            if (out_of_time()) break;
+            if (is_backward_action(*target_opp, opp_a)) continue;
+
+            int onx = ox + dx[opp_a];
+            int ony = oy + dy[opp_a];
+            if (onx < 0 || onx >= max_width || ony < 0 || ony >= max_height) continue;
+            int opp_npos = ony * max_width + onx;
+            int16_t opp_cell = state.grid[opp_npos];
+            if (opp_cell == CELL_WALL || opp_cell >= CELL_SNAKE_BASE) continue;
+
+            GameState next_state = state;
+            vector<int> sim_my_actions = default_my_actions;
+            vector<int> sim_opp_actions = default_opp_actions;
+            sim_my_actions[my_idx] = a;
+            sim_opp_actions[opp_idx] = opp_a;
+            next_state.simulate(sim_my_actions, sim_opp_actions);
+
+            int v = local_alpha_beta_value(
+                next_state,
+                my_snake_id,
+                target_opp_id,
+                self->length,
+                target_opp->length,
+                depth - 1,
+                -999999,
+                999999
+            );
+
+            worst = min(worst, v);
+        }
+
+        if (worst == 999999) {
+            GameState next_state = state;
+            vector<int> sim_my_actions = default_my_actions;
+            vector<int> sim_opp_actions = default_opp_actions;
+            sim_my_actions[my_idx] = a;
+            next_state.simulate(sim_my_actions, sim_opp_actions);
+            worst = evaluate_local_combat(next_state, my_snake_id, target_opp_id, self->length, target_opp->length);
+        }
+        value = worst;
+
+        if (value > best_value) {
+            best_value = value;
+            best_action = a;
+        }
+    }
+
+    return best_action;
+}
+
+static int min_steps_to_powerup_gain(const GameState& state, int snake_id, int start_length, int depth_left) {
+    if (out_of_time()) return 999999;
+
+    const Snake* self = state.find_my_snake_by_id(snake_id);
+    if (self == nullptr || !self->is_alive) return 999999;
+    if (self->length > start_length) return 0;
+    if (depth_left <= 0) return 999999;
+
+    int my_idx = find_my_snake_index(state, snake_id);
+    if (my_idx == -1) return 999999;
+
+    vector<int> default_my_actions = infer_default_actions(state.my_snakes);
+    vector<int> default_opp_actions = infer_default_actions(state.opp_snakes);
+
+    int head_pos = self->body[self->head_idx];
+    int hx = head_pos % max_width;
+    int hy = head_pos / max_width;
+    int dx[] = {0, 0, -1, 1};
+    int dy[] = {-1, 1, 0, 0};
+    int best = 999999;
+
+    for (int a = 0; a < 4; ++a) {
+        if (is_backward_action(*self, a)) continue;
+
+        int nx = hx + dx[a];
+        int ny = hy + dy[a];
+        if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
+
+        int n_pos = ny * max_width + nx;
+        int16_t next_cell = state.grid[n_pos];
+        if (next_cell == CELL_WALL || next_cell >= CELL_SNAKE_BASE) continue;
+
+        GameState next_state = state;
+        vector<int> sim_my_actions = default_my_actions;
+        vector<int> sim_opp_actions = default_opp_actions;
+        sim_my_actions[my_idx] = a;
+        next_state.simulate(sim_my_actions, sim_opp_actions);
+
+        const Snake* next_self = next_state.find_my_snake_by_id(snake_id);
+        if (next_self == nullptr || !next_self->is_alive) continue;
+        if (next_self->length > start_length) {
+            best = min(best, 1);
+            continue;
+        }
+
+        int rec = min_steps_to_powerup_gain(next_state, snake_id, start_length, depth_left - 1);
+        if (rec < 999999) {
+            best = min(best, 1 + rec);
+        }
+    }
+
+    return best;
+}
+
+static int first_action_to_powerup_gain(const GameState& state, int snake_id, int max_depth) {
+    const Snake* self = state.find_my_snake_by_id(snake_id);
+    if (self == nullptr || !self->is_alive) return -1;
+
+    int my_idx = find_my_snake_index(state, snake_id);
+    if (my_idx == -1) return -1;
+
+    vector<int> default_my_actions = infer_default_actions(state.my_snakes);
+    vector<int> default_opp_actions = infer_default_actions(state.opp_snakes);
+
+    int head_pos = self->body[self->head_idx];
+    int hx = head_pos % max_width;
+    int hy = head_pos / max_width;
+    int dx[] = {0, 0, -1, 1};
+    int dy[] = {-1, 1, 0, 0};
+
+    int best_action = -1;
+    int best_steps = 999999;
+
+    for (int a = 0; a < 4; ++a) {
+        if (is_backward_action(*self, a)) continue;
+
+        int nx = hx + dx[a];
+        int ny = hy + dy[a];
+        if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
+
+        int n_pos = ny * max_width + nx;
+        int16_t next_cell = state.grid[n_pos];
+        if (next_cell == CELL_WALL || next_cell >= CELL_SNAKE_BASE) continue;
+
+        GameState next_state = state;
+        vector<int> sim_my_actions = default_my_actions;
+        vector<int> sim_opp_actions = default_opp_actions;
+        sim_my_actions[my_idx] = a;
+        next_state.simulate(sim_my_actions, sim_opp_actions);
+
+        const Snake* next_self = next_state.find_my_snake_by_id(snake_id);
+        if (next_self == nullptr || !next_self->is_alive) continue;
+
+        int steps = 999999;
+        if (next_self->length > self->length) {
+            steps = 1;
+        } else {
+            steps = min_steps_to_powerup_gain(next_state, snake_id, next_self->length, max_depth - 1);
+            if (steps < 999999) {
+                steps += 1;
+            }
+        }
+
+        if (steps < best_steps) {
+            best_steps = steps;
+            best_action = a;
+        }
+    }
+
+    return best_steps < 999999 ? best_action : -1;
+}
+
+#ifdef LOCAL_TEST
+void run_local_tests() {
+    cerr << "Running local memory constraint and cloning tests..." << endl;
+    
+    // Run mock grid allocation test
+    world_width = 20;
+    world_height = 20;
+    total_powerups_count = 10;
+    
+    max_len = 3 + total_powerups_count;
+    max_width = (2 * max_len) + world_width;
+    max_height = world_height + 2 * max_len;
+    grid_size = max_width * max_height;
+    
+    GameState root_state;
+    root_state.grid.assign(grid_size, CELL_EMPTY);
+    
+    Snake s1;
+    s1.id = 0; s1.is_alive = true; s1.length = 3; s1.head_idx = 0; s1.tail_idx = 2;
+    s1.body.assign(max_len, -1);
+    s1.body[0] = 5 * max_width + 5;
+    s1.body[1] = 5 * max_width + 6;
+    s1.body[2] = 5 * max_width + 7;
+    root_state.my_snakes.push_back(s1);
+    
+    auto t1 = high_resolution_clock::now();
+    int iterations = 10000;
+    for(int i = 0; i < iterations; i++) {
+        GameState copy = root_state;
+        vector<int> my_acts = {1}; // DOWN
+        vector<int> opp_acts = {};
+        copy.simulate(my_acts, opp_acts);
+    }
+    auto t2 = high_resolution_clock::now();
+    auto ms_taken = duration_cast<milliseconds>(t2 - t1).count();
+    
+    cerr << "Simulated " << iterations << " branches in " << ms_taken << "ms" << endl;
+    cerr << "Avg time per clone+simulate: " << (float)ms_taken / iterations << "ms" << endl;
+    
+    if ((float)ms_taken/iterations < 0.1f) {
+        cerr << "[PASS] Target < 0.1ms achieved" << endl;
+    } else {
+        cerr << "[WARN] Target < 0.1ms missed" << endl;
+    }
+    exit(0);
+}
+#endif
+
+int main() {
+    signal(SIGSEGV, crash_signal_handler);
+    signal(SIGABRT, crash_signal_handler);
+    signal(SIGFPE, crash_signal_handler);
+    signal(SIGILL, crash_signal_handler);
+    std::set_terminate(bot_terminate_handler);
+#ifdef LOCAL_TEST
+    run_local_tests();
+#endif
+    int my_id;
+    cin >> my_id;
+    cin.ignore();
+    cin >> world_width;
+    cin.ignore();
+    cin >> world_height;
+    cin.ignore();
+
+    // In the first turn, we don't know total powerups yet, but we read the initial state.
+    // Let's store the initial rows to parse them later once we know the dimensions.
+    vector<string> initial_rows(world_height);
+    for (int i = 0; i < world_height; i++) {
+        getline(cin, initial_rows[i]);
+    }
+    
+    int snakebots_per_player;
+    cin >> snakebots_per_player;
+    cin.ignore();
+    
+    vector<int> my_snakebots;
+    int my_snakebot_id;
+    for (int i = 0; i < snakebots_per_player; i++) {
+        cin >> my_snakebot_id;
+        cin.ignore();
+        my_snakebots.push_back(my_snakebot_id);
+    }
+    int opp_snakebot_id;
+    for (int i = 0; i < snakebots_per_player; i++) {
+        cin >> opp_snakebot_id;
+        cin.ignore();
+    }
+    
+    // Commands array and counter omitted for logic bot
+    
+    // game loop
+    bool is_first_turn = true;
+    int counter = 0;
+    GameState state;
+    vector<int16_t> static_walls;
+
+    auto loop_start = high_resolution_clock::now();  // Global loop start
+    while (1) {
+        counter++;
+        auto iter_start = high_resolution_clock::now();  // Per-iteration start
+        turn_start_time = iter_start;
+        
+        int power_source_count = 0;
+        if (!(cin >> power_source_count)) {
+            break;
+        }
+        cin.ignore();
+
+        if (is_first_turn) {
+            total_powerups_count = power_source_count;
+            max_len = 3 + total_powerups_count;
+            max_width = (2 * max_len) + world_width;
+            max_height = (2 * max_len) + world_height;
+            grid_size = max_width * max_height;
+
+            state.grid.assign(grid_size, CELL_EMPTY);
+
+            // Now parse the initial_rows map into the center of the new grid.
+            int start_x = max_len;
+            int start_y = max_len; // Put it in the middle vertically as well
+            
+            for (int y = 0; y < world_height; y++) {
+                for (int x = 0; x < world_width; x++) {
+                    if (initial_rows[y][x] == '#') {
+                        state.grid[(start_y + y) * max_width + (start_x + x)] = CELL_WALL;
+                    }
+                }
+            }
+            static_walls = state.grid;
+
+            map_has_open_left_edge = false;
+            map_has_open_right_edge = false;
+            map_has_open_floor_edge = false;
+            for (int y = 0; y < world_height; ++y) {
+                int left_pos = (max_len + y) * max_width + max_len;
+                int right_pos = (max_len + y) * max_width + (max_len + world_width - 1);
+                if (static_walls[left_pos] != CELL_WALL) map_has_open_left_edge = true;
+                if (static_walls[right_pos] != CELL_WALL) map_has_open_right_edge = true;
+            }
+            for (int x = 0; x < world_width; ++x) {
+                int bottom_pos = (max_len + world_height - 1) * max_width + (max_len + x);
+                if (static_walls[bottom_pos] != CELL_WALL) map_has_open_floor_edge = true;
+            }
+            is_first_turn = false;
+        }
+
+        // Reset dynamic state (snakes, powerups) while preserving static walls.
+        state.grid = static_walls;
+
+        for (int i = 0; i < power_source_count; i++) {
+            int x = 0;
+            int y = 0;
+            cin >> x >> y;
+            cin.ignore();
+            
+            int sx = max_len + x;
+            int sy = max_len + y;
+            state.grid[sy * max_width + sx] = CELL_POWERUP;
+        }
+
+        int snakebot_count = 0;
+        cin >> snakebot_count;
+        cin.ignore();
+        
+        // Reset dynamic snake states arrays since we overwrite parsed data
+        state.my_snakes.clear();
+        state.opp_snakes.clear();
+        
+        for (int i = 0; i < snakebot_count; i++) {
+            int snakebot_id;
+            string body_str;
+            if (!(cin >> snakebot_id >> body_str)) {
+                break;
+            }
+            cin.ignore();
+
+            Snake s;
+            s.id = snakebot_id;
+            s.is_alive = true;
+            s.body.assign(max_len, -1);
+            
+            // Parse body "x,y:x2,y2"
+            int body_count = 0;
+            size_t pos = 0;
+            while (pos < body_str.length()) {
+                size_t comma = body_str.find(',', pos);
+                size_t colon = body_str.find(':', comma);
+                if (colon == string::npos) colon = body_str.length();
+                
+                int x = stoi(body_str.substr(pos, comma - pos));
+                int y = stoi(body_str.substr(comma + 1, colon - comma - 1));
+                
+                int sx = max_len + x;
+                int sy = max_len + y;
+                
+                if (body_count < max_len) {
+                    s.body[body_count++] = sy * max_width + sx;
+                }
+                state.grid[sy * max_width + sx] = CELL_SNAKE_BASE + s.id;
+                pos = colon + 1;
+            }
+            s.length = body_count;
+            if (s.length <= 0) {
+                continue;
+            }
+            s.head_idx = 0;
+            s.tail_idx = s.length - 1;
+            // Add to the correct player's list
+            bool is_mine = false;
+            for (int id : my_snakebots) {
+                if (id == s.id) {
+                    is_mine = true;
+                    break;
+                }
+            }
+            if (is_mine) {
+                state.my_snakes.push_back(s);
+            } else {
+                state.opp_snakes.push_back(s);
+            }
+        }
+
+        // --- DEBUG Dump Grid State on Turn 1 --- (Removed to save ms)
+
+        // --- DECISION LOGIC ---
+        
+        // 1. Calculate Voronoi board control
+        GameState::VoronoiResult v_res = state.calculate_voronoi();
+
+        vector<int> powerup_positions;
+        powerup_positions.reserve(power_source_count);
+        for (int pos = 0; pos < grid_size; ++pos) {
+            if (out_of_time()) break;
+            if (state.grid[pos] == CELL_POWERUP) {
+                powerup_positions.push_back(pos);
+            }
+        }
+
+        DangerMapResult danger = build_enemy_danger_map(state, 2);
+        vector<SnakeRole> snake_roles = assign_dynamic_roles(state, powerup_positions, counter);
+
+        auto manhattan = [](int p1, int p2) {
+            int x1 = p1 % max_width;
+            int y1 = p1 / max_width;
+            int x2 = p2 % max_width;
+            int y2 = p2 / max_width;
+            return abs(x1 - x2) + abs(y1 - y2);
+        };
+        
+        // 2. Decide actions for each of my snakes independently
+        vector<string> action_strs;
+        vector<int> current_my_actions(state.my_snakes.size(), 0);
+        vector<int> default_my_actions(state.my_snakes.size(), 0);
+        for (size_t i = 0; i < state.my_snakes.size(); ++i) {
+            default_my_actions[i] = infer_previous_action(state.my_snakes[i]);
+        }
+        vector<int> default_opp_actions(state.opp_snakes.size(), 0);
+        for (size_t i = 0; i < state.opp_snakes.size(); ++i) {
+            default_opp_actions[i] = infer_previous_action(state.opp_snakes[i]);
+        }
+        int dx[] = {0, 0, -1, 1};
+        int dy[] = {-1, 1, 0, 0};
+        
+        for (size_t s_idx = 0; s_idx < state.my_snakes.size(); ++s_idx) {
+            Snake& s = state.my_snakes[s_idx];
+            if (!s.is_alive) continue;
+            
+            int head_pos = s.body[s.head_idx];
+            int hx = head_pos % max_width;
+            int hy = head_pos / max_width;
+            int fallback_action = infer_previous_action(s);
+            int best_action = fallback_action;
+            int best_score = -999999;
+            SnakeRole role = snake_roles[s_idx];
+            bool overlap_enemy_danger = (head_pos >= 0 && head_pos < grid_size && danger.danger_map[head_pos] > 0);
+            int nearest_enemy_head_dist = 999999;
+            for (const auto& opp : state.opp_snakes) {
+                if (!opp.is_alive || opp.length <= 0) continue;
+                int opp_head = opp.body[opp.head_idx];
+                int d = abs(hx - (opp_head % max_width)) + abs(hy - (opp_head / max_width));
+                nearest_enemy_head_dist = min(nearest_enemy_head_dist, d);
+            }
+
+            if (out_of_time()) {
+                current_my_actions[s_idx] = fallback_action;
+                action_strs.push_back(to_string(s.id) + " " + action_to_string(fallback_action));
+                continue;
+            }
+
+            if (overlap_enemy_danger && danger.danger_map[head_pos] >= danger.high_risk_threshold && nearest_enemy_head_dist <= 5 && !out_of_time()) {
+                int local_depth = (state.my_snakes.size() > 1) ? 2 : 3;
+                int local_ab_action = choose_local_alpha_beta_action(state, s.id, local_depth);
+                if (local_ab_action != -1) {
+                    current_my_actions[s_idx] = local_ab_action;
+                    action_strs.push_back(to_string(s.id) + " " + action_to_string(local_ab_action));
+                    continue;
+                }
+            }
+
+            if (powerup_positions.size() == 1 && (!overlap_enemy_danger || nearest_enemy_head_dist > 3)) {
+                int apple_pos = powerup_positions[0];
+                int ax = apple_pos % max_width;
+                int ay = apple_pos / max_width;
+                int map_mid_x = max_len + (world_width / 2);
+                if (map_has_open_floor_edge && map_has_open_left_edge && ax <= max_len + 1 && hx <= map_mid_x && ay < hy) {
+                    int up_pos = (hy - 1) * max_width + hx;
+                    int16_t up_cell = state.grid[up_pos];
+                    if (!is_backward_action(s, 0) && up_cell != CELL_WALL && up_cell < CELL_SNAKE_BASE) {
+                        current_my_actions[s_idx] = 0;
+                        action_strs.push_back(to_string(s.id) + " " + action_to_string(0));
+                        continue;
+                    }
+                    if (hx > ax) {
+                        int left_pos = hy * max_width + (hx - 1);
+                        int16_t left_cell = state.grid[left_pos];
+                        if (!is_backward_action(s, 2) && left_cell != CELL_WALL && left_cell < CELL_SNAKE_BASE) {
+                            current_my_actions[s_idx] = 2;
+                            action_strs.push_back(to_string(s.id) + " " + action_to_string(2));
+                            continue;
+                        }
+                    }
+                }
+                if (ax == hx && ay < hy) {
+                    current_my_actions[s_idx] = 0;
+                    action_strs.push_back(to_string(s.id) + " " + action_to_string(0));
+                    continue;
+                }
+                if (ay == hy - 1 && abs(ax - hx) == 1) {
+                    int tactical_action = (ax < hx) ? 2 : 3;
+                    current_my_actions[s_idx] = tactical_action;
+                    action_strs.push_back(to_string(s.id) + " " + action_to_string(tactical_action));
+                    continue;
+                }
+                if (map_has_open_left_edge && !map_has_open_floor_edge && ax <= max_len + 1 && hx <= map_mid_x) {
+                    if (map_has_open_floor_edge && hy >= max_len + world_height - 3) {
+                        int nx = hx;
+                        int ny = hy - 1;
+                        int n_pos = ny * max_width + nx;
+                        int16_t next_cell = state.grid[n_pos];
+                        if (!is_backward_action(s, 0) && next_cell != CELL_WALL && next_cell < CELL_SNAKE_BASE) {
+                            current_my_actions[s_idx] = 0;
+                            action_strs.push_back(to_string(s.id) + " " + action_to_string(0));
+                            continue;
+                        }
+                    }
+                    if (hx > ax) {
+                        int nx = hx - 1;
+                        int ny = hy;
+                        int n_pos = ny * max_width + nx;
+                        int16_t next_cell = state.grid[n_pos];
+                        if (!is_backward_action(s, 2) && next_cell != CELL_WALL && next_cell < CELL_SNAKE_BASE) {
+                            current_my_actions[s_idx] = 2;
+                            action_strs.push_back(to_string(s.id) + " " + action_to_string(2));
+                            continue;
+                        }
+                    }
+                    if (hx == ax && hy > ay) {
+                        int nx = hx;
+                        int ny = hy - 1;
+                        int n_pos = ny * max_width + nx;
+                        int16_t next_cell = state.grid[n_pos];
+                        if (!is_backward_action(s, 0) && next_cell != CELL_WALL && next_cell < CELL_SNAKE_BASE) {
+                            current_my_actions[s_idx] = 0;
+                            action_strs.push_back(to_string(s.id) + " " + action_to_string(0));
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if (!powerup_positions.empty() && !out_of_time()) {
+                GameState local_plan_state = state;
+                local_plan_state.opp_snakes.clear();
+                bool open_edge_map = map_has_open_left_edge || map_has_open_right_edge || map_has_open_floor_edge;
+                int planner_depth = 5;
+                if (open_edge_map && powerup_positions.size() == 1) {
+                    planner_depth = map_has_open_floor_edge ? 16 : 12;
+                }
+                int tactical_action = first_action_to_powerup_gain(local_plan_state, s.id, planner_depth);
+                if (tactical_action != -1) {
+                    int tnx = hx;
+                    int tny = hy;
+                    if (tactical_action == 0) tny -= 1;
+                    else if (tactical_action == 1) tny += 1;
+                    else if (tactical_action == 2) tnx -= 1;
+                    else if (tactical_action == 3) tnx += 1;
+
+                    bool tactical_acceptable = true;
+                    if (tnx >= 0 && tnx < max_width && tny >= 0 && tny < max_height) {
+                        int tpos = tny * max_width + tnx;
+                        int danger_weight = (tpos >= 0 && tpos < grid_size) ? static_cast<int>(danger.danger_map[tpos]) : 0;
+                        int16_t tcell = state.grid[tpos];
+                        bool critical_objective = (tcell == CELL_POWERUP && v_res.length_delta < 0);
+                        if (danger_weight >= danger.high_risk_threshold && !critical_objective) {
+                            tactical_acceptable = false;
+                        }
+                    }
+
+                    if (tactical_acceptable) {
+                        current_my_actions[s_idx] = tactical_action;
+                        action_strs.push_back(to_string(s.id) + " " + action_to_string(tactical_action));
+                        continue;
+                    }
+                }
+            }
+
+            // Try all 4 directions (0:UP, 1:DOWN, 2:LEFT, 3:RIGHT)
+            for (int a = 0; a < 4; ++a) {
+                if (out_of_time()) break;
+                if (is_backward_action(s, a)) continue;
+
+                int nx = hx + dx[a];
+                int ny = hy + dy[a];
+                if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
+
+                int n_pos = ny * max_width + nx;
+                int16_t next_cell = state.grid[n_pos];
+                if (next_cell == CELL_WALL || next_cell >= CELL_SNAKE_BASE) {
+                    continue;
+                }
+
+                int score = 0;
+                bool critical_objective = (next_cell == CELL_POWERUP && v_res.length_delta < 0);
+                int danger_weight = (n_pos >= 0 && n_pos < grid_size) ? static_cast<int>(danger.danger_map[n_pos]) : 0;
+
+                if (danger_weight >= danger.high_risk_threshold && !critical_objective) {
+                    score -= 14000 + danger_weight * 1200;
+                } else {
+                    score -= danger_weight * 600;
+                }
+
+                // Survive constraints first.
+                if (!state.survives_flood_fill(n_pos, max(2, s.length / 2))) {
+                    score -= 20000;
+                } else {
+                    score += 200;
+                }
+
+                bool defensive_mode = (s.length >= 4 && v_res.length_delta >= 0);
+
+                // Prefer immediate powerup captures unless we're already ahead and switching defensive.
+                if (next_cell == CELL_POWERUP) {
+                    bool enclosed_map = !map_has_open_left_edge && !map_has_open_right_edge && !map_has_open_floor_edge;
+                    if (enclosed_map && total_powerups_count == 2 && s.length >= 4) {
+                        score -= 100000;
+                    } else {
+                        score += 32000;
+                    }
+                }
+
+                // Exclusive / contested heuristic proxy using distances to all heads.
+                if (!powerup_positions.empty() && !out_of_time()) {
+                    int best_powerup_eval = -999999;
+                    for (int p_pos : powerup_positions) {
+                        if (out_of_time()) break;
+                        int my_dist = manhattan(n_pos, p_pos);
+                        int opp_best_dist = 999999;
+                        for (const auto& opp : state.opp_snakes) {
+                            if (!opp.is_alive) continue;
+                            opp_best_dist = min(opp_best_dist, manhattan(opp.body[opp.head_idx], p_pos));
+                        }
+                        int eval = defensive_mode ? (my_dist * 60) : (-my_dist * 100);
+                        if (opp_best_dist < 999999) {
+                            eval += (opp_best_dist * 10);
+                        }
+                        if (eval > best_powerup_eval) {
+                            best_powerup_eval = eval;
+                        }
+                    }
+                    score += best_powerup_eval;
+                }
+
+                // Strategic mode (length delta) from Voronoi summary.
+                score += v_res.length_delta * 50;
+                score += v_res.my_exclusive_powerups * 20;
+                score -= v_res.opp_exclusive_powerups * 20;
+
+                int nearest_enemy_now = 999999;
+                int nearest_enemy_after = 999999;
+                int nearest_short_enemy_after = 999999;
+                for (const auto& opp : state.opp_snakes) {
+                    if (!opp.is_alive || opp.length <= 0) continue;
+                    int opp_head = opp.body[opp.head_idx];
+                    int ox = opp_head % max_width;
+                    int oy = opp_head / max_width;
+                    nearest_enemy_now = min(nearest_enemy_now, abs(hx - ox) + abs(hy - oy));
+                    int d_after = abs(nx - ox) + abs(ny - oy);
+                    nearest_enemy_after = min(nearest_enemy_after, d_after);
+                    if (opp.length <= 3) nearest_short_enemy_after = min(nearest_short_enemy_after, d_after);
+                }
+
+                int nearest_ally_after = 999999;
+                for (size_t ally_idx = 0; ally_idx < state.my_snakes.size(); ++ally_idx) {
+                    if (ally_idx == s_idx) continue;
+                    const Snake& ally = state.my_snakes[ally_idx];
+                    if (!ally.is_alive || ally.length <= 0) continue;
+                    int ally_head = ally.body[ally.head_idx];
+                    nearest_ally_after = min(
+                        nearest_ally_after,
+                        abs(nx - (ally_head % max_width)) + abs(ny - (ally_head / max_width))
+                    );
+                }
+
+                if (role == SnakeRole::Collector) {
+                    if (next_cell == CELL_POWERUP) score += 7000;
+                    if (nearest_enemy_after <= 2) score -= 2200;
+                } else if (role == SnakeRole::Support) {
+                    if (nearest_ally_after < 999999) score += max(0, 1800 - nearest_ally_after * 350);
+                    if (next_cell == CELL_POWERUP && nearest_ally_after <= 2) score -= 1400;
+                } else if (role == SnakeRole::Defender) {
+                    if (nearest_enemy_after <= 4) score += 1600;
+                    if (nearest_enemy_after > nearest_enemy_now) score -= 900;
+                } else if (role == SnakeRole::Suffocator) {
+                    if (nearest_enemy_after < nearest_enemy_now) score += 1500;
+                    if (nearest_enemy_after <= 1) score += 700;
+                } else if (role == SnakeRole::Killer) {
+                    if (nearest_short_enemy_after < 999999) score += max(0, 2800 - nearest_short_enemy_after * 600);
+                    if (next_cell == CELL_POWERUP) score -= 800;
+                }
+
+                // Small wall-avoidance and center preference using playable-board coordinates.
+                int playable_nx = nx - max_len;
+                score -= abs(playable_nx - (world_width / 2));
+
+                // Cheap 1-turn lookahead: avoid entering dead boxes and reward moves
+                // that set up a guaranteed immediate apple on the next turn.
+                if (!out_of_time()) {
+                    GameState next_state = state;
+                    vector<int> sim_my_actions = default_my_actions;
+                    vector<int> sim_opp_actions = default_opp_actions;
+                    sim_my_actions[s_idx] = a;
+                    next_state.simulate(sim_my_actions, sim_opp_actions);
+
+                    const Snake* next_self = next_state.find_my_snake_by_id(s.id);
+                    if (next_self == nullptr || !next_self->is_alive) {
+                        score -= 50000;
+                    } else {
+                        int simulated_head_pos = next_self->body[next_self->head_idx];
+                        int shx = simulated_head_pos % max_width;
+                        int shy = simulated_head_pos / max_width;
+                        if (shx < max_len || shx >= max_len + world_width) {
+                            score -= 35000;
+                        }
+                        if (shy >= max_len + world_height) {
+                            score -= 50000;
+                        }
+                        if (map_has_open_left_edge && hx == max_len && a == 2) {
+                            score -= 25000;
+                        }
+                        if (map_has_open_right_edge && hx == max_len + world_width - 1 && a == 3) {
+                            score -= 25000;
+                        }
+
+                        int followups = next_state.count_safe_followups(*next_self);
+                        score += followups * 3000;
+                        if (followups == 0) score -= 20000;
+                        if (followups == 1) score -= 9000;
+                        if (next_state.has_adjacent_powerup(simulated_head_pos)) {
+                            score += 7000;
+                        }
+
+                        if (next_cell == CELL_POWERUP && !out_of_time()) {
+                            GameState delayed_state = next_state;
+                            vector<int> delayed_my_actions = infer_default_actions(delayed_state.my_snakes);
+                            vector<int> delayed_opp_actions = infer_default_actions(delayed_state.opp_snakes);
+                            int my_index_delayed = find_my_snake_index(delayed_state, s.id);
+                            if (my_index_delayed != -1) {
+                                delayed_my_actions[my_index_delayed] = infer_previous_action(*next_self);
+                            }
+                            delayed_state.simulate(delayed_my_actions, delayed_opp_actions);
+                            const Snake* delayed_self = delayed_state.find_my_snake_by_id(s.id);
+                            if (delayed_self == nullptr || !delayed_self->is_alive) {
+                                score -= 70000;
+                            }
+                        }
+
+                        if (!powerup_positions.empty() && !out_of_time()) {
+                            GameState local_plan_state = next_state;
+                            local_plan_state.opp_snakes.clear();
+                            int steps_to_gain = min_steps_to_powerup_gain(local_plan_state, s.id, next_self->length, 4);
+                            if (steps_to_gain < 999999) {
+                                score += 26000 - steps_to_gain * 2500;
+                            } else {
+                                score -= 12000;
+                            }
+                        }
+                    }
+                }
+                
+                if (score > best_score) {
+                    best_score = score;
+                    best_action = a;
+                }
+            }
+            
+            current_my_actions[s_idx] = best_action;
+
+            // Format ID ACTION
+            action_strs.push_back(to_string(s.id) + " " + action_to_string(best_action));
+        }
+        
+        // Join actions with semicolons
+        string output = "";
+        for (size_t i = 0; i < action_strs.size(); ++i) {
+            output += action_strs[i];
+            if (i < action_strs.size() - 1) output += ";";
+        }
+        if (output.empty()) output = "WAIT";
+
+        auto iter_elapsed = duration_cast<microseconds>(high_resolution_clock::now() - iter_start);
+        
+        mylog << "Turn " << counter << " elapsed: " << iter_elapsed.count() << "ys, output: " << output << '\n';
+        cout << output << endl;
+    }
+}
