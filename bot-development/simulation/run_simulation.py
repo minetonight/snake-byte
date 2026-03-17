@@ -2,12 +2,33 @@ import subprocess
 import re
 import os
 
+def parse_expected_scores(map_file):
+    expected_p1 = None
+    expected_p2 = None
+
+    if not map_file:
+        return expected_p1, expected_p2
+
+    abs_map_path = os.path.abspath(map_file)
+    if not os.path.exists(abs_map_path):
+        return expected_p1, expected_p2
+
+    with open(abs_map_path, 'r') as f:
+        for line in f:
+            if line.startswith("EXPECTED_SCORE_P1:"):
+                expected_p1 = int(line.split(":")[1].strip())
+            elif line.startswith("EXPECTED_SCORE_P2:"):
+                expected_p2 = int(line.split(":")[1].strip())
+
+    return expected_p1, expected_p2
+
 def run_simulation(bot1_path, bot2_path, map_file=None, seed=None):
     # The directory where pom.xml is located
     winter_challenge_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../WinterChallenge2026-Exotec")
     
     # We pass the paths combined with ||| to handle spaces safely via Maven properties
     # mvn compile exec:java -Dexec.mainClass=HeadlessMain -Dexec.classpathScope=test -Dexec.args="python3 config/Boss.py|||python3 config/Boss.py" -q 
+    # mvn compile exec:java -Dexec.mainClass=Main -Dexec.classpathScope=test -Dexec.args="python3 config/Boss.py|||python3 config/Boss.py|||6451822396277461000" -q 
     command = [
         "mvn", "compile", "exec:java", 
         "-Dexec.mainClass=HeadlessMain", 
@@ -15,23 +36,10 @@ def run_simulation(bot1_path, bot2_path, map_file=None, seed=None):
         f'-Dexec.args={bot1_path}|||{bot2_path}|||{seed if seed is not None else ""}',
     ]
 
-    expected_p1 = None
-    expected_p2 = None
+    expected_p1, expected_p2 = parse_expected_scores(map_file)
 
     if map_file:
-        # Pass the aboslute path of the map file if provided
         abs_map_path = os.path.abspath(map_file)
-        
-        # Parse expected scores from the map file
-        if os.path.exists(abs_map_path):
-            with open(abs_map_path, 'r') as f:
-                for line in f:
-                    if line.startswith("EXPECTED_SCORE_P1:"):
-                        expected_p1 = int(line.split(":")[1].strip())
-                    elif line.startswith("EXPECTED_SCORE_P2:"):
-                        expected_p2 = int(line.split(":")[1].strip())
-
-    if map_file:
         print(f"\n[{os.path.basename(map_file)}]")
         command.append(f"-DcustomMapFile={abs_map_path}")
     # -DcustomMapFile=/home/aleks/Development/Python/snake-byte/bot-development/test-maps/test_map_with2-left-angled-snake.txt
@@ -63,18 +71,26 @@ def run_simulation(bot1_path, bot2_path, map_file=None, seed=None):
 
     p1_score = int(p1_match.group(1))
     p2_score = int(p2_match.group(1))
-    
+
+    # Validation against expected score
     # Validation against expected score
     if expected_p1 is not None or expected_p2 is not None:
-        if expected_p1 is not None and p1_score != expected_p1:
-            print(f"❌ FAILED P1: Expected {expected_p1}, got {p1_score}")
-        elif expected_p1 is not None:
-            print(f"✅ PASSED P1: {p1_score}")
-            
-        if expected_p2 is not None and p2_score != expected_p2:
-            print(f"❌ FAILED P2: Expected {expected_p2}, got {p2_score}")
-        elif expected_p2 is not None:
-            print(f"✅ PASSED P2: {p2_score}")
+        if expected_p1 is not None:
+            if p1_score < expected_p1:
+                print(f"❌ FAILED P1: Expected {expected_p1}, got {p1_score}")
+            elif p1_score > expected_p1:
+                print(f"🔝 EXCEEDED P1: Expected {expected_p1}, got {p1_score}")  # new case 
+            else:
+                print(f"✅ PASSED P1: {p1_score}")
+
+        if expected_p2 is not None:
+            if p2_score < expected_p2:
+                print(f"❌ FAILED P2: Expected {expected_p2}, got {p2_score}") 
+            elif p2_score > expected_p2:
+                print(f"🔝 EXCEEDED P2: Expected {expected_p2}, got {p2_score}")  # new case 
+            else:
+                print(f"✅ PASSED P2: {p2_score}")
+
 
     return p1_score, p2_score
 
@@ -103,16 +119,19 @@ def manualMode():
     bot1 = f"{os.path.join(base_dir, '../bots/epic-2-hovering-flying-snakes.exe')}"
     bot1 = f"{os.path.join(base_dir, '../bots/epic2-solver-bot.exe')}"
     bot1 = f"{os.path.join(base_dir, '../bots/epic3-solver-bot.exe')}"
+    bot1 = f"{os.path.join(base_dir, '../bots/epic4-solver-bot.exe')}"
 
     # bot2 = "../bots/rightBoss.py" 
     # bot2 = "../bots/leftBoss.py" 
     bot2 = "../bots/Boss.py" 
     bot2 = f"python3 {os.path.join(base_dir, bot2)}"
-    # bot1 = bot2
+    bot2 = bot1
     
     """ test all custom maps """
-    test_all_maps(bot1, bot2)
+    # test_all_maps(bot1, bot2)
+    test_all_maps(bot1, bot2, "pathing")
     test_all_maps(bot1, bot2, "tactics")
+    test_all_maps(bot1, bot2)
     
     """ test standart codingame engine """
     ###### for _ in range(5):
