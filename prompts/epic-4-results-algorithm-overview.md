@@ -195,6 +195,101 @@ That is the right frame for the current Epic 4 work.
 
 ---
 
+## March 19, 2026 evolution: reachable-frontier planning
+
+During debugging of `complex-pathing/11-bigmap-E45Sx-long-term-target.txt`, a new failure mode became clear:
+
+- the bot could mark an apple as "reachable"
+- but that judgement was still partly based on a mixed set of path metrics
+- and one of those metrics (`build_head_only_gravity_path_to_target()`) could be too optimistic because it validated only a gravity-settled head path, not the full future body evolution
+
+This created a structural mismatch:
+
+1. **Target assignment** could accept a long-range apple based on a simplified reachability test.
+2. **Execution** then depended on fallback routing, cached path steps, walls-only BFS, and local heuristics.
+3. The bot could oscillate in a basin while still believing the apple was strategically valid.
+
+### Main diagnosis
+
+The issue was not just "bad move choice".
+
+The deeper issue was that Epic 4 mixed several incompatible notions of distance and reachability:
+
+- **walls-only BFS distance**
+- **gravity-aware path length**
+- **head-only gravity reachability**
+- **local fallback progress**
+
+Those are individually useful, but together they can produce false confidence about long-term target accessibility.
+
+### New design direction
+
+The planned replacement direction is a cleaner single reachability model:
+
+> **bounded reachable-frontier scanning over real simulated states**
+
+Instead of first assigning a distant target and only later trying to route toward it with mixed fallback layers, the bot should:
+
+1. simulate only states that are actually reachable under the game physics
+2. scan those states up to a bounded ply depth
+3. collect only the apples that are reached inside that simulated frontier
+4. choose among those apples only
+
+This is effectively a **simultaneous mapping and positioning** pass over the reachable state frontier.
+
+### Reachable apples rule
+
+Under this evolution, an apple is no longer considered reachable because a simplified planner says so.
+
+It is considered reachable only if the bounded simulated frontier actually reaches a state where that apple is collected.
+
+That makes the meaning of reachability much stricter and more consistent with the real physics.
+
+### No-apple fallback rule
+
+If no apple is found within the reachable ply depth, the bot should not keep inventing a questionable long-range apple route.
+
+Instead it should:
+
+1. choose a **long-term exploration goal** near the center of the map
+2. persist that goal for later turns
+3. keep moving toward it using the same reachable-frontier scan
+4. override that long-term goal immediately when a reachable apple is discovered in a later scan
+
+This preserves forward progress without relying on optimistic target certification.
+
+### Why center is a good fallback
+
+A center-leaning exploration goal is useful because it often:
+
+- reduces commitment to dead-end side basins
+- keeps more route options open
+- increases the chance that later scans expose additional apples
+
+The important detail is that the center target should also be chosen through the same reachability model whenever practical, so that fallback behavior remains consistent with the planner.
+
+### Practical architecture change
+
+This led to a new preferred structure for the deep-only successor bot:
+
+1. **Reachable frontier scan** from the current single-snake state
+2. **Reachable apple selection** if any apples are found in that frontier
+3. **Persistent center-oriented exploration goal** if no apples are found
+4. **Immediate override** of the long-term goal when a reachable apple appears
+
+### Code-level implication
+
+This evolution argues for a cleaner successor implementation rather than continuing to grow the already mixed `epic4-solver-BFS-bot.cpp` target-assignment and fallback stack.
+
+The successor should:
+
+- remove the mode-macro layering and unused compile-time branches
+- keep the proven simulation core
+- replace optimistic long-range target certification with reachable-frontier scanning
+- make the long-term goal system explicit and traceable in logs
+
+---
+
 ## Simplified bot variants
 
 To make the code easier to understand without changing the current hybrid bot, the following working variants were created:
