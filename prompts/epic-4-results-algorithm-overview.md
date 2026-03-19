@@ -288,6 +288,46 @@ The successor should:
 - replace optimistic long-range target certification with reachable-frontier scanning
 - make the long-term goal system explicit and traceable in logs
 
+### March 19, 2026 bug fix: root frontier expansion under gravity
+
+While validating the clean frontier bot on `complex-pathing/03` and `complex-pathing/04`, a deeper simulation bug was found.
+
+The initial suspicion was that root children were being discarded by the frontier filter:
+
+- `next_self->length < start_length`
+
+That turned out to be a false lead.
+
+The real issue was earlier in the simulation pipeline:
+
+- after gravity, airborne snakes were being stamped back onto the grid
+- that restamp included the head cell before collision resolution
+- `resolve_collisions()` then interpreted the head as landing on a snake cell
+- root children were falsely rejected as dead
+
+So the frontier often collapsed to only the root state on short gravity maps, which then forced fallback behavior.
+
+The fix in `epic4-reachable-frontier-bot.cpp` was to avoid stamping the airborne snake head before collision resolution and leave only the body stamped at that phase.
+
+### Validation snapshot after the gravity fix, local contest safety pass, and trap-apple filter
+
+Mirror validation against `epic4-reachable-frontier-bot.exe` on the focused regression set currently gives:
+
+- `02-deadly apple.txt` -> `(6, 4)`
+- `03 check gravity mid path-left side.txt` -> `(4, 3)`
+- `04 check gravity mid path-right side.txt` -> `(4, 3)`
+- `05 check gravity long path.txt` -> `(4, 3)`
+- `06-plan-fall.txt` -> `(6, 3)`
+- `11-bigmap-E45Sx-long-term-target.txt` -> `(7, 7)`
+
+Interpretation:
+
+- the gravity root-expansion bug is fixed
+- the short-map regression cluster on `03`, `04`, and `06` was resolved by adding a local immediate-loss safety filter on top of the frontier choice, so weaker or equal snakes stop walking into short-range punishable head-to-heads
+- `02` was a different bug: the frontier accepted a reachable apple even when the gained state had no simulated legal exit, so the snake walked into a corner trap and then collapsed to `expanded=1`; the fix was to reject post-growth states with zero simulated safe follow-ups
+- long-range frontier behavior on map `11` remains restored at `(7, 7)`
+- the focused regression set is now green on the current clean frontier bot
+
 ---
 
 ## Simplified bot variants
