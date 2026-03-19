@@ -38,6 +38,9 @@ static constexpr int SCAN_DEPTH_LARGE = 26;
 static constexpr int DIRECT_APPLE_MAX_DIST = 10;
 static constexpr int LONG_TERM_GOAL_TTL = 20;
 static constexpr int APPLE_GOAL_TTL = 28;
+static constexpr int DEEP_SCAN_BUDGET_PCT = 70;
+static constexpr int FOLLOWTHROUGH_BUDGET_PCT = 20;
+static constexpr int TURN_RESERVE_BUDGET_PCT = 10;
 
 ofstream make_log_stream() {
     return ofstream(string(BOT_LOG_PREFIX) + to_string(getpid()) + ".txt", ios::app);
@@ -45,6 +48,23 @@ ofstream make_log_stream() {
 
 ofstream mylog = make_log_stream();
 auto turn_start_time = high_resolution_clock::now();
+
+enum class SearchPhase {
+    None,
+    DeepScan,
+    FollowThrough,
+};
+
+struct PhaseTimingBudget {
+    int deep_scan_budget_ms = TURN_BUDGET_MS;
+    int followthrough_budget_ms = TURN_BUDGET_MS;
+    int deep_scan_used_ms = 0;
+    int followthrough_used_ms = 0;
+};
+
+PhaseTimingBudget* g_active_phase_budget = nullptr;
+SearchPhase g_active_phase = SearchPhase::None;
+high_resolution_clock::time_point g_active_phase_started = high_resolution_clock::now();
 
 void crash_signal_handler(int sig) {
     cerr << "FATAL_SIGNAL " << sig << endl;
@@ -64,8 +84,69 @@ static int elapsed_turn_ms() {
     return static_cast<int>(duration_cast<milliseconds>(high_resolution_clock::now() - turn_start_time).count());
 }
 
+static void charge_active_phase_time() {
+    if (g_active_phase_budget == nullptr || g_active_phase == SearchPhase::None) return;
+    auto now = high_resolution_clock::now();
+    int elapsed_ms = static_cast<int>(duration_cast<milliseconds>(now - g_active_phase_started).count());
+    if (elapsed_ms <= 0) return;
+    if (g_active_phase == SearchPhase::DeepScan) {
+        g_active_phase_budget->deep_scan_used_ms += elapsed_ms;
+    } else if (g_active_phase == SearchPhase::FollowThrough) {
+        g_active_phase_budget->followthrough_used_ms += elapsed_ms;
+    }
+    g_active_phase_started = now;
+}
+
+static int phase_used_ms(const PhaseTimingBudget& budget, SearchPhase phase) {
+    int used = 0;
+    if (phase == SearchPhase::DeepScan) used = budget.deep_scan_used_ms;
+    else if (phase == SearchPhase::FollowThrough) used = budget.followthrough_used_ms;
+
+    if (g_active_phase_budget == &budget && g_active_phase == phase) {
+        used += static_cast<int>(duration_cast<milliseconds>(high_resolution_clock::now() - g_active_phase_started).count());
+    }
+    return used;
+}
+
+static bool phase_budget_exhausted(const PhaseTimingBudget& budget, SearchPhase phase) {
+    if (phase == SearchPhase::DeepScan) {
+        return phase_used_ms(budget, phase) >= budget.deep_scan_budget_ms;
+    }
+    if (phase == SearchPhase::FollowThrough) {
+        return phase_used_ms(budget, phase) >= budget.followthrough_budget_ms;
+    }
+    return false;
+}
+
+struct ScopedSearchPhase {
+    PhaseTimingBudget* previous_budget = nullptr;
+    SearchPhase previous_phase = SearchPhase::None;
+    high_resolution_clock::time_point previous_started = high_resolution_clock::now();
+
+    ScopedSearchPhase(PhaseTimingBudget* budget, SearchPhase phase) {
+        charge_active_phase_time();
+        previous_budget = g_active_phase_budget;
+        previous_phase = g_active_phase;
+        previous_started = g_active_phase_started;
+        g_active_phase_budget = budget;
+        g_active_phase = phase;
+        g_active_phase_started = high_resolution_clock::now();
+    }
+
+    ~ScopedSearchPhase() {
+        charge_active_phase_time();
+        g_active_phase_budget = previous_budget;
+        g_active_phase = previous_phase;
+        g_active_phase_started = high_resolution_clock::now();
+    }
+};
+
 static bool out_of_time() {
-    return elapsed_turn_ms() >= TURN_BUDGET_MS;
+    if (elapsed_turn_ms() >= TURN_BUDGET_MS) return true;
+    if (g_active_phase_budget != nullptr && g_active_phase != SearchPhase::None) {
+        return phase_budget_exhausted(*g_active_phase_budget, g_active_phase);
+    }
+    return false;
 }
 
 constexpr int16_t CELL_WALL = -1;
@@ -90,6 +171,8 @@ struct PersistentGoal {
 struct ScanBudgetConfig {
     int depth_limit = SCAN_DEPTH_SMALL;
     int expansion_limit = SCAN_EXPANSION_LIMIT;
+    int scan_budget_ms = TURN_BUDGET_MS;
+    int followthrough_budget_ms = TURN_BUDGET_MS;
     const char* tier = "medium";
 };
 
@@ -988,17 +1071,21 @@ static bool has_reachable_future_growth(const GameState& state, int snake_id, in
     return false;
 }
 
-static FrontierScanResult scan_reachable_frontier(const GameState& state, int snake_id, int depth_limit, int expansion_limit, int desired_goal_pos) {
+static FrontierScanResult scan_reachable_frontier(const GameState& state, int snake_id, const ScanBudgetConfig& budget, int desired_goal_pos) {
     FrontierScanResult result;
     GameState start_state = isolate_state_for_single_snake_planning(state, snake_id);
     const Snake* start_self = start_state.find_my_snake_by_id(snake_id);
     if (start_self == nullptr || !start_self->is_alive || start_self->length <= 0) return result;
+    const int board_area = world_width * world_height;
+    const int depth_limit = budget.depth_limit;
+    const int expansion_limit = budget.expansion_limit;
 
     vector<int> initial_powerups;
     initial_powerups.reserve(16);
     for (int pos = 0; pos < grid_size; ++pos) {
         if (start_state.grid[pos] == CELL_POWERUP) initial_powerups.push_back(pos);
     }
+    const bool use_strict_followthrough_checks = board_area <= 320 && initial_powerups.size() <= 4;
 
     deque<SearchNode> nodes;
     int start_head = start_self->body[start_self->head_idx];
@@ -1015,6 +1102,10 @@ static FrontierScanResult scan_reachable_frontier(const GameState& state, int sn
     apple_progress_by_target.reserve(initial_powerups.size());
     unordered_set<int> dead_end_apple_targets;
     dead_end_apple_targets.reserve(initial_powerups.size());
+    PhaseTimingBudget phase_budget;
+    phase_budget.deep_scan_budget_ms = max(4, budget.scan_budget_ms);
+    phase_budget.followthrough_budget_ms = max(2, budget.followthrough_budget_ms);
+    ScopedSearchPhase deep_scan_phase(&phase_budget, SearchPhase::DeepScan);
 
     int dx[] = {0, 0, -1, 1};
     int dy[] = {-1, 1, 0, 0};
@@ -1101,21 +1192,27 @@ static FrontierScanResult scan_reachable_frontier(const GameState& state, int sn
             if (next_self->length > cur_self->length) {
                 int simulated_followups = count_simulated_safe_followups(next_state, *next_self);
                 if (simulated_followups <= 0) continue;
-                int simulated_followthroughs = count_simulated_safe_followthrough_moves(next_state, *next_self);
-                if (simulated_followthroughs <= 0) {
-                    dead_end_apple_targets.insert(next_head);
-                    continue;
-                }
-                int remaining_powerups = count_powerups_on_grid(next_state);
-                bool future_growth_reachable = true;
-                if (remaining_powerups > 0) {
-                    int continuation_depth = min(28, max(depth_limit, 24));
-                    int continuation_expansion = min(SCAN_EXPANSION_LIMIT, max(expansion_limit, 3200));
-                    future_growth_reachable = has_reachable_future_growth(next_state, snake_id, continuation_depth, continuation_expansion);
-                }
-                if (remaining_powerups > 0 && !future_growth_reachable && simulated_followthroughs <= 1) {
-                    dead_end_apple_targets.insert(next_head);
-                    continue;
+                int simulated_followthroughs = simulated_followups;
+                if (use_strict_followthrough_checks && !phase_budget_exhausted(phase_budget, SearchPhase::FollowThrough)) {
+                    ScopedSearchPhase followthrough_phase(&phase_budget, SearchPhase::FollowThrough);
+                    simulated_followthroughs = count_simulated_safe_followthrough_moves(next_state, *next_self);
+                    if (!out_of_time()) {
+                        if (simulated_followthroughs <= 0) {
+                            dead_end_apple_targets.insert(next_head);
+                            continue;
+                        }
+                        int remaining_powerups = count_powerups_on_grid(next_state);
+                        bool future_growth_reachable = true;
+                        if (remaining_powerups > 0) {
+                            int continuation_depth = min(28, max(depth_limit, 24));
+                            int continuation_expansion = min(SCAN_EXPANSION_LIMIT, max(expansion_limit, 3200));
+                            future_growth_reachable = has_reachable_future_growth(next_state, snake_id, continuation_depth, continuation_expansion);
+                        }
+                        if (!out_of_time() && remaining_powerups > 0 && !future_growth_reachable && simulated_followthroughs <= 1) {
+                            dead_end_apple_targets.insert(next_head);
+                            continue;
+                        }
+                    }
                 }
                 if (!result.found_apple
                     || next_depth < result.apple_depth
@@ -1210,6 +1307,8 @@ static ScanBudgetConfig choose_scan_budget(const GameState& state, const Snake& 
     int remaining_ms = max(0, TURN_BUDGET_MS - elapsed_turn_ms());
     int remaining_snakes = max<int>(1, static_cast<int>(total_snakes - snake_index));
     int fair_share_ms = remaining_ms / remaining_snakes;
+    config.scan_budget_ms = max(4, (fair_share_ms * DEEP_SCAN_BUDGET_PCT) / 100);
+    config.followthrough_budget_ms = max(2, (fair_share_ms * FOLLOWTHROUGH_BUDGET_PCT) / 100);
     if (fair_share_ms < 16) {
         config.depth_limit = min(config.depth_limit, 8);
         config.expansion_limit = min(config.expansion_limit, 900);
@@ -1226,6 +1325,12 @@ static ScanBudgetConfig choose_scan_budget(const GameState& state, const Snake& 
 
     config.depth_limit = max(6, min(config.depth_limit, 28));
     config.expansion_limit = max(600, min(config.expansion_limit, SCAN_EXPANSION_LIMIT));
+    int total_phase_budget_ms = config.scan_budget_ms + config.followthrough_budget_ms;
+    int max_assignable_ms = max(6, (fair_share_ms * (100 - TURN_RESERVE_BUDGET_PCT)) / 100);
+    if (total_phase_budget_ms > max_assignable_ms) {
+        config.scan_budget_ms = max(4, (config.scan_budget_ms * max_assignable_ms) / total_phase_budget_ms);
+        config.followthrough_budget_ms = max(2, max_assignable_ms - config.scan_budget_ms);
+    }
     return config;
 }
 
@@ -1458,7 +1563,7 @@ int main() {
             }
 
             ScanBudgetConfig scan_budget = choose_scan_budget(state, s, s_idx, state.my_snakes.size(), apple_goal.target_pos != -1);
-            FrontierScanResult scan = scan_reachable_frontier(state, s.id, scan_budget.depth_limit, scan_budget.expansion_limit, desired_goal);
+            FrontierScanResult scan = scan_reachable_frontier(state, s.id, scan_budget, desired_goal);
 
             int chosen_action = -1;
             int chosen_target = -1;
@@ -1521,6 +1626,8 @@ int main() {
                   << " scan_tier=" << scan_budget.tier
                   << " scan_depth=" << scan_budget.depth_limit
                   << " expansion_limit=" << scan_budget.expansion_limit
+                  << " scan_budget_ms=" << scan_budget.scan_budget_ms
+                  << " followthrough_budget_ms=" << scan_budget.followthrough_budget_ms
                   << " expanded=" << scan.expanded
                   << " explored_states=" << scan.explored_states
                   << " apple_depth=" << (scan.found_apple ? scan.apple_depth : -1)
