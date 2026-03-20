@@ -29,6 +29,8 @@ def run_simulation(bot1_path, bot2_path, map_file=None, seed=None):
     # We pass the paths combined with ||| to handle spaces safely via Maven properties
     # mvn compile exec:java -Dexec.mainClass=HeadlessMain -Dexec.classpathScope=test -Dexec.args="python3 config/Boss.py|||python3 config/Boss.py" -q 
     # mvn compile exec:java -Dexec.mainClass=Main -Dexec.classpathScope=test -Dexec.args="python3 config/Boss.py|||python3 config/Boss.py|||6451822396277461000" -q 
+    # mvn compile exec:java -Dexec.mainClass=Main -Dexec.classpathScope=test -Dexec.args="/home/aleks/Development/Python/snake-byte/bot-development/bots/epic4-solver-BFS-bot.exe|||/home/aleks/Development/Python/snake-byte/bot-development/bots/epic4-solver-BFS-bot.exe" -DcustomMapFile=/home/aleks/Development/Python/snake-byte/bot-development/test-maps/complex-pathing/11-bigmap-E45Sx-long-term-target.txt -q 
+    # mvn compile exec:java -Dexec.mainClass=Main -Dexec.classpathScope=test -Dexec.args="/home/aleks/Development/Python/snake-byte/bot-development/bots/epic7-coop-reachable-frontier-bot.exe|||/home/aleks/Development/Python/snake-byte/bot-development/bots/epic7-coop-reachable-frontier-bot.exe" -DcustomMapFile=/home/aleks/Development/Python/snake-byte/bot-development/test-maps/pathing/08-scary-safe-apple.txt -q 
     command = [
         "mvn", "compile", "exec:java", 
         "-Dexec.mainClass=HeadlessMain", 
@@ -42,7 +44,7 @@ def run_simulation(bot1_path, bot2_path, map_file=None, seed=None):
         abs_map_path = os.path.abspath(map_file)
         print(f"\n[{os.path.basename(map_file)}]")
         command.append(f"-DcustomMapFile={abs_map_path}")
-    # -DcustomMapFile=/home/aleks/Development/Python/snake-byte/bot-development/test-maps/test_map_with2-left-angled-snake.txt
+    # -DcustomMapFile=/home/aleks/Development/Python/snake-byte/bot-development/test-maps/complex-pathing/11-bigmap-E45Sx-long-term-target.txt
 
     command.append("-q")
     
@@ -120,6 +122,7 @@ def manualMode():
     bot1 = f"{os.path.join(base_dir, '../bots/epic2-solver-bot.exe')}"
     bot1 = f"{os.path.join(base_dir, '../bots/epic3-solver-bot.exe')}"
     bot1 = f"{os.path.join(base_dir, '../bots/epic4-solver-bot.exe')}"
+    bot1 = f"{os.path.join(base_dir, '../bots/epic7-coop-reachable-frontier-bot.exe')}"
 
     # bot2 = "../bots/rightBoss.py" 
     # bot2 = "../bots/leftBoss.py" 
@@ -129,10 +132,14 @@ def manualMode():
     
     """ test all custom maps """
     # test_all_maps(bot1, bot2)
+    test_all_maps(bot1, bot2, "complex-pathing")
+    # test_all_maps(bot1, bot2, "coop")
+    test_all_maps(bot1, bot2, "enemies")
+    # test_all_maps(bot1, bot2, "multi-snake")
     test_all_maps(bot1, bot2, "pathing")
     test_all_maps(bot1, bot2, "tactics")
-    test_all_maps(bot1, bot2)
     
+
     """ test standart codingame engine """
     ###### for _ in range(5):
     #     print("Scores (P1, P2):", run_simulation(bot1, bot2))
