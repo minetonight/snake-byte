@@ -328,6 +328,125 @@ Interpretation:
 - long-range frontier behavior on map `11` remains restored at `(7, 7)`
 - the focused regression set is now green on the current clean frontier bot
 
+### March 19, 2026 timing-budget change: percentage phases instead of hard per-search constants
+
+When the frontier bot was moved onto larger many-target maps such as `complex-pathing/12a-bigmap-E6Sx-many-targets.txt`, a new failure mode appeared:
+
+- the newer follow-through / trap-apple safety checks were correct on short tactical maps
+- but on big many-target turns they consumed too much of the same fixed time bucket
+- later snakes then inherited too little effective search time
+- the result was oscillation, shallow fallback behavior, and in some runs outright timeout pressure
+
+The important lesson was that the problem was **not** the existence of the extra safety checks.
+The problem was that the bot still budgeted time too much like a single-snake searcher.
+
+### Structural fix
+
+The clean frontier bot moved to a percentage-based turn budget split:
+
+- `DEEP_SCAN_BUDGET_PCT = 70`
+- `FOLLOWTHROUGH_BUDGET_PCT = 20`
+- `TURN_RESERVE_BUDGET_PCT = 10`
+
+And, crucially, each snake now derives its budget from the **remaining turn time divided by remaining friendly snakes**.
+
+So instead of saying:
+
+> every search may spend up to some fixed millisecond constant
+
+the bot now says:
+
+> each remaining snake gets a fair share of the remaining turn, and each search phase may only consume its slice of that fair share
+
+### Why this changed behavior on many-snake maps
+
+This produced a useful emergent effect.
+
+Previously, the first snakes in the decision order could monopolize the turn with deeper scans or extra follow-through checks.
+That meant later snakes often degraded into:
+
+- `shallow`
+- `expanded=1`
+- `fallback_legal`
+
+even when the board still contained many reachable apples.
+
+After the percentage split:
+
+- early snakes can still search meaningfully
+- but they cannot consume the entire turn
+- later snakes retain enough budget to perform a nontrivial frontier scan
+- so multiple snakes can independently discover reachable apples in the same turn
+
+That is why the timing fix started to look like a cooperation improvement even before any explicit cooperation logic was added.
+
+### Validation snapshot for the timing model
+
+The percentage-phase model restored the earlier frontier regressions while also fixing the large-map timeout/starvation issue:
+
+- `12a-bigmap-E6Sx-many-targets.txt` -> `(15, 16)`
+- `11-bigmap-E45Sx-long-term-target.txt` -> `(7, 7)`
+- `02-deadly apple.txt` -> `(6, 4)`
+- `07-corridor-lock.txt` -> `(3, 3)`
+- `03 check gravity mid path-left side.txt` -> `(4, 3)`
+
+### Design takeaway
+
+For the reachable-frontier family, time budgeting is part of the algorithm, not just an implementation detail.
+
+On many-snake boards, a good frontier policy requires:
+
+1. interruptible scans
+2. interruptible follow-through checks
+3. a protected reserve for command emission / wrap-up
+4. fairness across remaining friendly snakes
+
+Without those four pieces, the planner may look strategically correct in isolation but still behave badly once several snakes need useful search in the same turn.
+
+### March 19, 2026 engine-parity fix: move/eat/behead/fall order
+
+While debugging `pathing/08-scary-safe-apple.txt`, another important issue turned out to be **simulation parity with the real Java engine**, not frontier ranking.
+
+The Java engine turn order in [WinterChallenge2026-Exotec/src/main/java/com/codingame/game/Game.java](WinterChallenge2026-Exotec/src/main/java/com/codingame/game/Game.java#L448-L463) is:
+
+1. move
+2. eat
+3. behead / collision resolution
+4. fall
+
+The C++ frontier simulation had drifted to a different order:
+
+1. move
+2. fall
+3. collision / apple resolution
+
+That mismatch mattered on gravity-sensitive apple maps.
+
+On `08-scary-safe-apple`, the intended left-apple route was actually legal under the engine rules, but the old C++ simulator let gravity happen before apple consumption. The head touched the apple, then fell away from it, so the simulated state never recorded growth. That made the planner look overly scared of the apple when the deeper problem was simply that the simulator was wrong.
+
+### Practical fix
+
+The reachable-frontier simulator was updated to match the engine more closely:
+
+- movement now checks whether the new head enters an apple cell
+- growth is applied immediately on that move by keeping the tail and increasing length
+- apple removal happens before beheading logic
+- gravity is applied only after move/eat/behead resolution
+
+### Validation impact
+
+After the engine-order fix:
+
+- `08-scary-safe-apple.txt` now passes at `(4, 3)`
+- `08b-scary-safe-apple.txt` remains green at `(6, 3)`
+- `07-corridor-lock.txt` remains green at `(3, 3)`
+
+### Interpretation change
+
+This is an important correction to the earlier narrative around post-growth trap handling.
+
+Some apparent "bad apple choice" regressions were not planner mistakes at all. They were artifacts of a simulator that consumed apples in the wrong phase of the turn. For the reachable-frontier line of work, engine parity is therefore a prerequisite, not a cleanup detail.
+
 ---
 
 ## Simplified bot variants

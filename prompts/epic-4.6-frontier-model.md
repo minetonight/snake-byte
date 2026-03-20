@@ -205,3 +205,96 @@ At the moment, the clean frontier bot has already shown:
 - insufficient team scaling on map `12`
 
 Epic 4.6 is the work needed to turn that promising clean prototype into the main successor line.
+
+---
+
+## March 19, 2026 status update
+
+The implementation has now moved beyond the earliest Epic 4.6 prototype.
+
+### Completed or largely completed from Epic 4.6
+
+#### Story 1 — Adaptive frontier depth
+Implemented in practice as adaptive per-snake scan budgets using:
+
+- map size
+- snake count
+- remaining turn time
+- whether the snake already has an apple goal
+
+The active bot logs chosen depth, expansion limit, and scan tier per snake.
+
+#### Story 3 — Persistent proven apple goals
+Implemented.
+
+The frontier bot now keeps separate persistent apple goals and center goals, and the logs distinguish modes such as:
+
+- `reachable_apple`
+- `apple_progress`
+- `apple_goal`
+- `center_goal`
+
+#### Story 5 — Team scan scheduling
+Implemented in a simpler but working form.
+
+Instead of fixed per-snake duplication, each snake receives a fair share of the remaining turn budget. Earlier snakes can still scan more deeply, but later snakes are protected from total starvation.
+
+#### Story 6 — Frontier logging and diagnostics
+Implemented enough for active debugging.
+
+The current `FRONTIER_DECISION` logs include:
+
+- scan tier
+- scan depth
+- expansion limit
+- scan budget ms
+- followthrough budget ms
+- mode
+- target
+- expanded / explored counts
+
+### Major timing-budget change now part of Epic 4.6
+
+The earlier fixed-style search timing was replaced by percentage-based phase budgeting:
+
+- deep scan phase
+- follow-through phase
+- reserved wrap-up phase
+
+This matters because team scaling turned out to be a structural algorithm issue, not just a constant-tuning issue. The percentage split is the reason many-snake turns stopped starving later snakes so badly.
+
+### Pending Epic 4.6 tasks still open
+
+These are the most relevant remaining tasks now that coop-map debugging has started:
+
+1. **Short-path protection remains incomplete in the cooperative version**
+	- short direct apples are better than before
+	- but some snakes still choose or inherit bad low-escape local routes
+
+2. **Partial apple-progress ranking is still incomplete**
+	- the bot can still prefer locally reachable progress that is strategically poor
+	- especially when the resulting state has little or no escape structure
+
+3. **Team scheduling solved time fairness, but not full coordination**
+	- several snakes now get search time
+	- but explicit basin allocation / teammate differentiation is still needed
+
+4. **Stuck / shaft states are not modeled correctly yet**
+	- some snakes have only gravity-neutral same-body moves
+	- the frontier currently prunes those states as no-progress
+	- then fallback repeats an arbitrary locally legal move until the snake eventually dies
+
+5. **Survival-aware contested frontier paths remain backlog but are still relevant**
+	- the isolated frontier model is still too optimistic in some contested corridors
+
+### Practical handoff to Epic 7 coop work
+
+Epic 4.6 delivered the clean frontier base and the timing model that made multi-snake work feasible.
+
+The next implementation pressure is no longer “make the frontier search exist.”
+It is:
+
+- classify hold / shaft states correctly
+- reduce low-escape apple bait in team play
+- diversify teammate basin choices
+- keep the percentage-based time fairness intact while doing so
