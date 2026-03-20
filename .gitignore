@@ -8,3 +8,5 @@ prompts/senior-dev-consultant.md
 prompts/strategic-planner.md
 */__pycache__/*.pyc
 run*asan.sh
+bot-development/simulation/angled-debug.txt
+bot-development/*/*log_*.txt
