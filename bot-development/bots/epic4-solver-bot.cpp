@@ -10,6 +10,8 @@
 #include <csignal>
 #include <exception>
 #include <cstdint>
+#include <unordered_map>
+#include <unordered_set>
 using namespace std;
 using namespace std::chrono;
 
@@ -35,10 +37,113 @@ void bot_terminate_handler() {
 
 // --- TIME MANAGEMENT ---
 auto turn_start_time = high_resolution_clock::now();
+
+struct BotTuning {
+    static constexpr int TURN_MS_BUDGET_GUARD = 69;
+    static constexpr int LOCAL_COMBAT_LENGTH_WEIGHT = 140;
+    static constexpr int LOCAL_COMBAT_LOST_SEGMENT_WEIGHT = 220;
+    static constexpr int LOCAL_COMBAT_H2H_BONUS = 500;
+    static constexpr int LOCAL_COMBAT_HDIST_PENALTY = 20;
+
+    static constexpr int DANGER_HARD_BASE_PENALTY = 14000;
+    static constexpr int DANGER_HARD_WEIGHT = 1200;
+    static constexpr int DANGER_SOFT_WEIGHT = 600;
+    static constexpr int FLOODFILL_DEATH_PENALTY = 20000;
+    static constexpr int FLOODFILL_SURVIVE_BONUS = 200;
+    static constexpr int POWERUP_BONUS = 32000;
+    static constexpr int ENCLOSED_POWERUP_PENALTY = 100000;
+
+    static constexpr int VORONOI_LENGTH_DELTA_WEIGHT = 50;
+    static constexpr int VORONOI_MY_EXCLUSIVE_WEIGHT = 20;
+    static constexpr int VORONOI_OPP_EXCLUSIVE_WEIGHT = 20;
+
+    static constexpr int ROLE_COLLECTOR_POWER_BONUS = 7000;
+    static constexpr int ROLE_COLLECTOR_NEAR_ENEMY_PENALTY = 2200;
+    static constexpr int ROLE_SUPPORT_NEAR_ALLY_BONUS = 1800;
+    static constexpr int ROLE_SUPPORT_NEAR_ALLY_FALLOFF = 350;
+    static constexpr int ROLE_SUPPORT_POWER_NEAR_ALLY_PENALTY = 1400;
+    static constexpr int ROLE_DEFENDER_ENEMY_PROX_BONUS = 1600;
+    static constexpr int ROLE_DEFENDER_RETREAT_PENALTY = 900;
+    static constexpr int ROLE_SUFFOCATOR_APPROACH_BONUS = 1500;
+    static constexpr int ROLE_SUFFOCATOR_CLOSE_BONUS = 700;
+    static constexpr int ROLE_KILLER_SHORT_ENEMY_BONUS = 2800;
+    static constexpr int ROLE_KILLER_SHORT_ENEMY_FALLOFF = 600;
+    static constexpr int ROLE_KILLER_POWER_PENALTY = 800;
+
+    static constexpr int FOLLOWUP_COUNT_WEIGHT = 3000;
+    static constexpr int FOLLOWUP_ZERO_PENALTY = 20000;
+    static constexpr int FOLLOWUP_ONE_PENALTY = 9000;
+    static constexpr int ADJ_POWERUP_BONUS = 7000;
+    static constexpr int SIM_DEATH_PENALTY = 50000;
+    static constexpr int SIDE_EXIT_PENALTY = 35000;
+    static constexpr int FLOOR_EXIT_PENALTY = 50000;
+    static constexpr int OPEN_EDGE_EXIT_PENALTY = 25000;
+
+    static constexpr int DELAYED_DEATH_PENALTY = 70000;
+    static constexpr int DELAYED_LOW_FOLLOWUP_PENALTY = 13000;
+    static constexpr int DELAYED_NO_FOLLOWUP_PENALTY = 28000;
+
+    static constexpr int TARGET_COLLECTOR_DIST_WEIGHT = 170;
+    static constexpr int TARGET_SUPPORT_DIST_WEIGHT = 120;
+    static constexpr int TARGET_REACHED_BONUS = 1600;
+    static constexpr int SUPPORT_ROTATE_AWAY_BONUS = 2200;
+    static constexpr int SUPPORT_STAY_NEAR_COLLECT_PENALTY = 3200;
+    static constexpr int DANGER_MAP_PROJECTION_DEPTH = 3;
+};
+
 bool out_of_time() {
     auto now = high_resolution_clock::now();
     auto ms_passed = duration_cast<milliseconds>(now - turn_start_time).count();
-    return ms_passed >= 69; // ~95% of 73ms budget
+    return ms_passed >= BotTuning::TURN_MS_BUDGET_GUARD; // ~95% of 73ms budget
+}
+
+bool has_planner_time_budget(int ms_limit) {
+    auto now = high_resolution_clock::now();
+    auto ms_passed = duration_cast<milliseconds>(now - turn_start_time).count();
+    return ms_passed < ms_limit;
+}
+
+unordered_map<int, int> g_persistent_target_by_snake;
+unordered_map<int, bool> g_persistent_target_is_power;
+unordered_map<uint64_t, int> g_blocked_target_until_turn;
+int g_turn_counter = 0;
+
+struct SnakePathCache {
+    int target_pos = -1;
+    bool target_is_power = false;
+    int expected_start_head = -1;
+    int next_step = 0;
+    int last_dist = 999999;
+    int stall_turns = 0;
+    int exact_retry_cooldown = 0;
+    int last_head_pos = -1;
+    int no_move_turns = 0;
+    int same_target_turns = 0;
+    vector<int> actions;
+    vector<int> expected_heads;
+};
+
+unordered_map<int, SnakePathCache> g_path_cache_by_snake;
+
+// --- Incremental (persistent across turns) A* search state ---
+struct IncSearchOpenNode {
+    int f, g, idx;
+};
+
+static uint64_t make_snake_target_key(int snake_id, int target_pos) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(snake_id)) << 32) |
+           static_cast<uint32_t>(target_pos);
+}
+
+static bool is_target_temporarily_blocked(int snake_id, int target_pos) {
+    auto it = g_blocked_target_until_turn.find(make_snake_target_key(snake_id, target_pos));
+    if (it == g_blocked_target_until_turn.end()) return false;
+    return it->second > g_turn_counter;
+}
+
+static void block_target_for_turns(int snake_id, int target_pos, int turns) {
+    if (target_pos < 0) return;
+    g_blocked_target_until_turn[make_snake_target_key(snake_id, target_pos)] = g_turn_counter + max(1, turns);
 }
 
 // --- CONSTANTS ---
@@ -627,6 +732,29 @@ struct GameState {
     }
 };
 
+// --- Incremental A* search nodes (depend on GameState) ---
+struct IncSearchNode {
+    GameState state;
+    int parent_idx;
+    int8_t action;
+    int head_pos;
+    int g;
+};
+
+struct IncrementalSearchState {
+    vector<IncSearchNode> nodes;
+    vector<IncSearchOpenNode> open_heap; // stored as min-heap (smallest f at front)
+    unordered_map<uint64_t, int> best_g;
+    int goal_idx = -1;
+    bool exhausted = false;
+    bool initialized = false;
+    int target_pos = -1;
+    int snake_id = -1;
+    int root_head = -1; // head position when search was initialized
+};
+
+unordered_map<uint64_t, IncrementalSearchState> g_inc_search; // keyed by make_snake_target_key
+
 static vector<int> infer_default_actions(const vector<Snake>& snakes) {
     vector<int> actions(snakes.size(), 0);
     for (size_t i = 0; i < snakes.size(); ++i) {
@@ -777,6 +905,1020 @@ static vector<SnakeRole> assign_dynamic_roles(const GameState& state, const vect
     return roles;
 }
 
+struct TargetPlanResult {
+    vector<int> target_positions;
+    vector<bool> target_is_power;
+};
+
+static int manhattan_dist_pos(int p1, int p2) {
+    int x1 = p1 % max_width;
+    int y1 = p1 / max_width;
+    int x2 = p2 % max_width;
+    int y2 = p2 / max_width;
+    return abs(x1 - x2) + abs(y1 - y2);
+}
+
+static bool is_playable_cell(int pos) {
+    if (pos < 0 || pos >= grid_size) return false;
+    int x = (pos % max_width) - max_len;
+    int y = (pos / max_width) - max_len;
+    return x >= 0 && x < world_width && y >= 0 && y < world_height;
+}
+
+static bool is_reusable_target_cell(const GameState& state, int pos) {
+    if (!is_playable_cell(pos)) return false;
+    int16_t cell = state.grid[pos];
+    return cell != CELL_WALL && cell < CELL_SNAKE_BASE;
+}
+
+static int gravity_settle_token(const vector<int16_t>& nav_grid, int pos) {
+    if (!is_playable_cell(pos)) return -1;
+    while (true) {
+        int below = pos + max_width;
+        if (below < 0 || below >= grid_size) return -1;
+        if (!is_playable_cell(below)) return -1;
+        int16_t below_cell = nav_grid[below];
+        if (below_cell == CELL_WALL || below_cell == CELL_POWERUP) return pos;
+        pos = below;
+    }
+}
+
+static vector<int16_t> build_navigation_grid_without_snakes(const GameState& state) {
+    vector<int16_t> nav_grid = state.grid;
+    for (int i = 0; i < grid_size; ++i) {
+        if (nav_grid[i] >= CELL_SNAKE_BASE) nav_grid[i] = CELL_EMPTY;
+    }
+    return nav_grid;
+}
+
+static GameState isolate_state_for_single_snake_planning(const GameState& state, int snake_id) {
+    GameState isolated;
+    isolated.grid = state.grid;
+
+    const Snake* self = state.find_my_snake_by_id(snake_id);
+    if (self == nullptr) return isolated;
+
+    for (int i = 0; i < grid_size; ++i) {
+        if (isolated.grid[i] >= CELL_SNAKE_BASE) {
+            int occ_id = isolated.grid[i] - CELL_SNAKE_BASE;
+            isolated.grid[i] = (occ_id == snake_id) ? CELL_EMPTY : CELL_WALL;
+        }
+    }
+
+    isolated.my_snakes.push_back(*self);
+    isolated.opp_snakes.clear();
+
+    const Snake& own = isolated.my_snakes[0];
+    for (int k = 0; k < own.length; ++k) {
+        int b_idx = (own.head_idx + k) % ring_size(own);
+        int pos = own.body[b_idx];
+        if (pos >= 0 && pos < grid_size) isolated.grid[pos] = CELL_SNAKE_BASE + own.id;
+    }
+
+    return isolated;
+}
+
+static inline uint64_t hash_combine_u64(uint64_t seed, uint64_t value) {
+    seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+    return seed;
+}
+
+static uint64_t encode_single_snake_plan_hash(const GameState& state, const Snake& s) {
+    uint64_t h = 1469598103934665603ULL;
+    h = hash_combine_u64(h, static_cast<uint64_t>(s.length));
+    h = hash_combine_u64(h, static_cast<uint64_t>(s.head_idx));
+    h = hash_combine_u64(h, static_cast<uint64_t>(s.tail_idx));
+    for (int k = 0; k < s.length; ++k) {
+        int b_idx = (s.head_idx + k) % ring_size(s);
+        h = hash_combine_u64(h, static_cast<uint64_t>(s.body[b_idx] + 1));
+    }
+    for (int i = 0; i < grid_size; ++i) {
+        if (state.grid[i] == CELL_POWERUP) {
+            h = hash_combine_u64(h, static_cast<uint64_t>(i + 1000003));
+        }
+    }
+    return h;
+}
+
+static bool build_exact_full_body_path_to_target(
+    const GameState& state,
+    const Snake& s,
+    int target_pos,
+    vector<int>& out_actions,
+    vector<int>& out_heads
+) {
+    out_actions.clear();
+    out_heads.clear();
+
+    if (target_pos < 0 || target_pos >= grid_size) return false;
+    GameState start_state = isolate_state_for_single_snake_planning(state, s.id);
+    if (start_state.my_snakes.empty()) return false;
+
+    const Snake& start_snake = start_state.my_snakes[0];
+    int start_head = start_snake.body[start_snake.head_idx];
+    if (start_head == target_pos) return false;
+
+    struct SearchNode {
+        GameState state;
+        int parent_idx;
+        int action;
+        int head_pos;
+        int g;
+    };
+    struct OpenNode {
+        int f;
+        int g;
+        int idx;
+    };
+    struct OpenCmp {
+        bool operator()(const OpenNode& a, const OpenNode& b) const {
+            if (a.f != b.f) return a.f > b.f;
+            return a.g > b.g;
+        }
+    };
+
+    vector<SearchNode> nodes;
+    nodes.reserve(1024);
+    nodes.push_back({start_state, -1, -1, start_head, 0});
+
+    unordered_map<uint64_t, int> best_g;
+    best_g.reserve(2048);
+    best_g[encode_single_snake_plan_hash(start_state, start_snake)] = 0;
+
+    priority_queue<OpenNode, vector<OpenNode>, OpenCmp> open;
+    open.push({manhattan_dist_pos(start_head, target_pos), 0, 0});
+
+    int expansions = 0;
+    int goal_idx = -1;
+    const int max_expansions = 1000;
+    const int max_depth = 80;
+
+    while (!open.empty()) {
+        if (out_of_time()) return false;
+        OpenNode cur_open = open.top();
+        open.pop();
+
+        SearchNode cur = nodes[cur_open.idx];
+        const Snake& cur_snake = cur.state.my_snakes[0];
+        uint64_t cur_key = encode_single_snake_plan_hash(cur.state, cur_snake);
+        auto best_it = best_g.find(cur_key);
+        if (best_it == best_g.end() || best_it->second != cur.g) continue;
+
+        if (++expansions > max_expansions) break;
+        if (cur.head_pos == target_pos) {
+            goal_idx = cur_open.idx;
+            break;
+        }
+        if (cur.g >= max_depth) continue;
+
+        for (int a = 0; a < 4; ++a) {
+            if (is_backward_action(cur_snake, a)) continue;
+
+            GameState next_state = cur.state;
+            vector<int> my_actions = infer_default_actions(next_state.my_snakes);
+            vector<int> opp_actions;
+            my_actions[0] = a;
+            next_state.simulate(my_actions, opp_actions);
+
+            const Snake* next_snake = next_state.find_my_snake_by_id(s.id);
+            if (next_snake == nullptr || !next_snake->is_alive) continue;
+
+            int next_head = next_snake->body[next_snake->head_idx];
+            if (!is_playable_cell(next_head)) continue;
+
+            uint64_t next_key = encode_single_snake_plan_hash(next_state, *next_snake);
+            int next_g = cur.g + 1;
+            auto it = best_g.find(next_key);
+            if (it != best_g.end() && it->second <= next_g) continue;
+            best_g[next_key] = next_g;
+
+            int next_idx = static_cast<int>(nodes.size());
+            nodes.push_back({next_state, cur_open.idx, a, next_head, next_g});
+            int h = manhattan_dist_pos(next_head, target_pos);
+            open.push({next_g + h, next_g, next_idx});
+        }
+    }
+
+    if (goal_idx == -1) return false;
+
+    vector<int> rev_actions;
+    vector<int> rev_heads;
+    for (int idx = goal_idx; idx != -1; idx = nodes[idx].parent_idx) {
+        if (nodes[idx].action != -1) {
+            rev_actions.push_back(nodes[idx].action);
+            rev_heads.push_back(nodes[idx].head_pos);
+        }
+    }
+    reverse(rev_actions.begin(), rev_actions.end());
+    reverse(rev_heads.begin(), rev_heads.end());
+    out_actions.swap(rev_actions);
+    out_heads.swap(rev_heads);
+    return !out_actions.empty();
+}
+
+static bool build_head_only_gravity_path_to_target(
+    const GameState& state,
+    const Snake& s,
+    int target_pos,
+    vector<int>& out_actions,
+    vector<int>& out_heads
+) {
+    out_actions.clear();
+    out_heads.clear();
+
+    if (target_pos < 0 || target_pos >= grid_size) return false;
+    int start_pos = s.body[s.head_idx];
+    if (start_pos == target_pos) return false;
+
+    vector<int16_t> nav_grid = build_navigation_grid_without_snakes(state);
+    if (!is_playable_cell(start_pos) || !is_playable_cell(target_pos)) return false;
+    if (nav_grid[target_pos] == CELL_WALL) return false;
+
+    struct PlannerNode {
+        int f;
+        int g;
+        int pos;
+        int last_action;
+    };
+    struct PlannerCmp {
+        bool operator()(const PlannerNode& a, const PlannerNode& b) const {
+            if (a.f != b.f) return a.f > b.f;
+            return a.g > b.g;
+        }
+    };
+
+    const int action_count = 4;
+    const int node_count = grid_size * action_count;
+    const int INF = 1e9;
+    vector<int> best_g(node_count, INF);
+    vector<int> parent(node_count, -1);
+    vector<int8_t> parent_action(node_count, -1);
+    vector<int> head_after(node_count, -1);
+    priority_queue<PlannerNode, vector<PlannerNode>, PlannerCmp> pq;
+
+    int dx[] = {0, 0, -1, 1};
+    int dy[] = {-1, 1, 0, 0};
+    int start_last_action = infer_previous_action(s);
+    int start_x = start_pos % max_width;
+    int start_y = start_pos / max_width;
+
+    int expansions = 0;
+    for (int a = 0; a < 4; ++a) {
+        if (s.length > 1 && a == opposite_action(start_last_action)) continue;
+        int nx = start_x + dx[a];
+        int ny = start_y + dy[a];
+        if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
+        int n_pos = ny * max_width + nx;
+        if (!is_playable_cell(n_pos)) continue;
+        if (nav_grid[n_pos] == CELL_WALL) continue;
+        int settled = gravity_settle_token(nav_grid, n_pos);
+        if (settled == -1) continue;
+        int idx = settled * action_count + a;
+        int g = 1;
+        int h = manhattan_dist_pos(settled, target_pos);
+        if (g < best_g[idx]) {
+            best_g[idx] = g;
+            parent[idx] = -1;
+            parent_action[idx] = static_cast<int8_t>(a);
+            head_after[idx] = settled;
+            pq.push({g + h, g, settled, a});
+        }
+    }
+
+    int goal_idx = -1;
+    while (!pq.empty()) {
+        if (out_of_time()) return false;
+        PlannerNode cur = pq.top();
+        pq.pop();
+        int cur_idx = cur.pos * action_count + cur.last_action;
+        if (cur.g != best_g[cur_idx]) continue;
+        if (++expansions > 6000) break;
+        if (cur.pos == target_pos) {
+            goal_idx = cur_idx;
+            break;
+        }
+
+        int cx = cur.pos % max_width;
+        int cy = cur.pos / max_width;
+        for (int a = 0; a < 4; ++a) {
+            if (a == opposite_action(cur.last_action)) continue;
+            int nx = cx + dx[a];
+            int ny = cy + dy[a];
+            if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
+            int n_pos = ny * max_width + nx;
+            if (!is_playable_cell(n_pos)) continue;
+            if (nav_grid[n_pos] == CELL_WALL) continue;
+            int settled = gravity_settle_token(nav_grid, n_pos);
+            if (settled == -1) continue;
+
+            int next_g = cur.g + 1;
+            if (next_g > 160) continue;
+            int next_idx = settled * action_count + a;
+            if (next_g >= best_g[next_idx]) continue;
+
+            best_g[next_idx] = next_g;
+            parent[next_idx] = cur_idx;
+            parent_action[next_idx] = static_cast<int8_t>(a);
+            head_after[next_idx] = settled;
+            int h = manhattan_dist_pos(settled, target_pos);
+            pq.push({next_g + h, next_g, settled, a});
+        }
+    }
+
+    if (goal_idx == -1) return false;
+
+    vector<int> rev_actions;
+    vector<int> rev_heads;
+    for (int idx = goal_idx; idx != -1; idx = parent[idx]) {
+        rev_actions.push_back(parent_action[idx]);
+        rev_heads.push_back(head_after[idx]);
+    }
+    reverse(rev_actions.begin(), rev_actions.end());
+    reverse(rev_heads.begin(), rev_heads.end());
+    out_actions.swap(rev_actions);
+    out_heads.swap(rev_heads);
+    return !out_actions.empty();
+}
+
+static bool build_gravity_aware_path_to_target(
+    const GameState& state,
+    const Snake& s,
+    int target_pos,
+    vector<int>& out_actions,
+    vector<int>& out_heads
+) {
+    int dist = manhattan_dist_pos(s.body[s.head_idx], target_pos);
+    if (dist <= 30 && has_planner_time_budget(40) &&
+        build_exact_full_body_path_to_target(state, s, target_pos, out_actions, out_heads)) {
+        return true;
+    }
+    return build_head_only_gravity_path_to_target(state, s, target_pos, out_actions, out_heads);
+}
+
+// --- Incremental A* helpers ---
+static bool inc_open_cmp(const IncSearchOpenNode& a, const IncSearchOpenNode& b) {
+    if (a.f != b.f) return a.f > b.f; // min-heap: largest f -> lowest priority
+    return a.g > b.g;
+}
+
+static void inc_push_open(IncrementalSearchState& istate, const IncSearchOpenNode& n) {
+    istate.open_heap.push_back(n);
+    push_heap(istate.open_heap.begin(), istate.open_heap.end(), inc_open_cmp);
+}
+
+static IncSearchOpenNode inc_pop_open(IncrementalSearchState& istate) {
+    pop_heap(istate.open_heap.begin(), istate.open_heap.end(), inc_open_cmp);
+    IncSearchOpenNode top = istate.open_heap.back();
+    istate.open_heap.pop_back();
+    return top;
+}
+
+static void init_incremental_search(IncrementalSearchState& istate, const GameState& state, const Snake& s, int target_pos) {
+    istate.nodes.clear();
+    istate.nodes.reserve(256); // small hint; vector grows as needed
+    istate.open_heap.clear();
+    istate.best_g.clear();
+    istate.goal_idx = -1;
+    istate.exhausted = false;
+    istate.initialized = true;
+    istate.target_pos = target_pos;
+    istate.snake_id = s.id;
+
+    GameState start_state = isolate_state_for_single_snake_planning(state, s.id);
+    if (start_state.my_snakes.empty()) { istate.exhausted = true; return; }
+
+    const Snake& start_snake = start_state.my_snakes[0];
+    int start_head = start_snake.body[start_snake.head_idx];
+    istate.root_head = start_head;
+    if (start_head == target_pos) { istate.exhausted = true; return; }
+
+    { IncSearchNode n; n.state = start_state; n.parent_idx = -1; n.action = -1; n.head_pos = start_head; n.g = 0; istate.nodes.push_back(std::move(n)); }
+    uint64_t init_hash = encode_single_snake_plan_hash(start_state, start_snake);
+    istate.best_g[init_hash] = 0;
+    int h = manhattan_dist_pos(start_head, target_pos);
+    inc_push_open(istate, {h, 0, 0});
+}
+
+static bool continue_incremental_search(IncrementalSearchState& istate, int target_pos) {
+    if (!istate.initialized || istate.exhausted) return istate.goal_idx >= 0;
+    if (istate.goal_idx >= 0) return true;
+
+    // No per-turn node cap: search persists across turns (bounded only by time per turn)
+    // Total memory cap to prevent RAM exhaustion
+    const int max_total_nodes = 12000;
+    const int max_depth = 100;
+
+    while (!istate.open_heap.empty()) {
+        if (out_of_time()) break;
+        if ((int)istate.nodes.size() >= max_total_nodes) { istate.exhausted = true; break; }
+
+        IncSearchOpenNode cur_open = inc_pop_open(istate);
+
+        // Copy node fields by value BEFORE any push_back (prevents dangling refs after realloc)
+        uint64_t cur_key;
+        int cur_head_pos, cur_g_val;
+        GameState cur_state_copy;
+        {
+            const IncSearchNode& ref = istate.nodes[cur_open.idx];
+            cur_key = encode_single_snake_plan_hash(ref.state, ref.state.my_snakes[0]);
+            cur_head_pos = ref.head_pos;
+            cur_g_val = ref.g;
+            cur_state_copy = ref.state; // copy once per expansion
+        }
+
+        auto bg_it = istate.best_g.find(cur_key);
+        if (bg_it == istate.best_g.end() || bg_it->second != cur_g_val) continue; // stale
+
+        if (cur_head_pos == target_pos) {
+            istate.goal_idx = cur_open.idx;
+            return true;
+        }
+        if (cur_g_val >= max_depth) continue;
+
+        const Snake& cur_snake = cur_state_copy.my_snakes[0];
+        for (int a = 0; a < 4; ++a) {
+            if (is_backward_action(cur_snake, a)) continue;
+
+            GameState next_state = cur_state_copy;
+            vector<int> my_acts = {a};
+            vector<int> opp_acts;
+            next_state.simulate(my_acts, opp_acts);
+
+            const Snake* ns = next_state.find_my_snake_by_id(istate.snake_id);
+            if (!ns || !ns->is_alive) continue;
+            int next_head = ns->body[ns->head_idx];
+            if (!is_playable_cell(next_head)) continue;
+
+            uint64_t next_key = encode_single_snake_plan_hash(next_state, *ns);
+            int next_g = cur_g_val + 1;
+            auto nit = istate.best_g.find(next_key);
+            if (nit != istate.best_g.end() && nit->second <= next_g) continue;
+            istate.best_g[next_key] = next_g;
+
+            int next_idx = (int)istate.nodes.size();
+            { IncSearchNode nn; nn.state = std::move(next_state); nn.parent_idx = cur_open.idx;
+              nn.action = (int8_t)a; nn.head_pos = next_head; nn.g = next_g;
+              istate.nodes.push_back(std::move(nn)); }
+            int h = manhattan_dist_pos(next_head, target_pos);
+            inc_push_open(istate, {next_g + h, next_g, next_idx});
+        }
+    }
+
+    if (istate.open_heap.empty()) istate.exhausted = true;
+    return istate.goal_idx >= 0;
+}
+
+static bool extract_incremental_path(const IncrementalSearchState& istate, vector<int>& out_actions, vector<int>& out_heads) {
+    out_actions.clear();
+    out_heads.clear();
+    if (istate.goal_idx < 0) return false;
+
+    vector<int> rev_actions;
+    vector<int> rev_heads;
+    for (int idx = istate.goal_idx; idx != -1; idx = istate.nodes[idx].parent_idx) {
+        const IncSearchNode& n = istate.nodes[idx];
+        if (n.action != -1) {
+            rev_actions.push_back((int)n.action);
+            rev_heads.push_back(n.head_pos);
+        }
+    }
+    reverse(rev_actions.begin(), rev_actions.end());
+    reverse(rev_heads.begin(), rev_heads.end());
+    out_actions.swap(rev_actions);
+    out_heads.swap(rev_heads);
+    return !out_actions.empty();
+}
+
+static void invalidate_inc_search_for_snake(int snake_id) {
+    // Mark all inc search entries for this snake as uninitialized
+    for (auto& kv : g_inc_search) {
+        if (kv.second.snake_id == snake_id) {
+            kv.second.initialized = false;
+        }
+    }
+}
+
+static void invalidate_snake_target_cache(int snake_id) {
+    g_path_cache_by_snake.erase(snake_id);
+    invalidate_inc_search_for_snake(snake_id);
+}
+
+static int cached_gravity_path_action(const GameState& state, const Snake& s, int target_pos, bool target_is_power) {
+    if (target_pos == -1) {
+        invalidate_snake_target_cache(s.id);
+        return -1;
+    }
+
+    int head_pos = s.body[s.head_idx];
+    int dist = manhattan_dist_pos(head_pos, target_pos);
+    auto it = g_path_cache_by_snake.find(s.id);
+    if (it == g_path_cache_by_snake.end() || it->second.target_pos != target_pos || it->second.target_is_power != target_is_power) {
+        SnakePathCache fresh;
+        fresh.target_pos = target_pos;
+        fresh.target_is_power = target_is_power;
+        fresh.expected_start_head = head_pos;
+        fresh.last_dist = dist;
+        fresh.last_head_pos = head_pos;
+        fresh.same_target_turns = 0;
+        g_path_cache_by_snake[s.id] = fresh;
+        it = g_path_cache_by_snake.find(s.id);
+    }
+
+    SnakePathCache& cache = it->second;
+    cache.same_target_turns++;
+    if (cache.last_head_pos == head_pos) cache.no_move_turns++;
+    else cache.no_move_turns = 0;
+    cache.last_head_pos = head_pos;
+
+    int remaining_powerups = 0;
+    for (int p = 0; p < grid_size; ++p) {
+        if (state.grid[p] == CELL_POWERUP) remaining_powerups++;
+    }
+
+    // Close-range anti-cycle: if stuck very near target for many turns with other options
+    if (target_is_power && dist <= 3 && remaining_powerups > 1 && cache.same_target_turns >= 30) {
+        block_target_for_turns(s.id, target_pos, 8);
+        g_persistent_target_by_snake.erase(s.id);
+        g_persistent_target_is_power.erase(s.id);
+        invalidate_snake_target_cache(s.id);
+        return -1;
+    }
+
+    // Hard cap: truly stuck (no movement at all)
+    if (cache.no_move_turns >= 6) {
+        g_persistent_target_by_snake.erase(s.id);
+        g_persistent_target_is_power.erase(s.id);
+        invalidate_snake_target_cache(s.id);
+        return -1;
+    }
+
+    // Stall detection: not getting closer for many consecutive turns
+    if (dist >= cache.last_dist) cache.stall_turns++;
+    else cache.stall_turns = 0;
+    cache.last_dist = dist;
+
+    uint64_t inc_key = make_snake_target_key(s.id, target_pos);
+    auto& istate = g_inc_search[inc_key];
+    if (!istate.initialized || istate.snake_id != s.id || istate.target_pos != target_pos) {
+        init_incremental_search(istate, state, s, target_pos);
+    }
+    if (istate.initialized && istate.goal_idx < 0 && !istate.exhausted && has_planner_time_budget(50)) {
+        continue_incremental_search(istate, target_pos);
+    }
+
+    // If incremental search exhausted with no path: target is unreachable
+    auto inc_check = g_inc_search.find(inc_key);
+    bool inc_exhausted_no_path = (inc_check != g_inc_search.end() &&
+                                   inc_check->second.initialized &&
+                                   inc_check->second.exhausted &&
+                                   inc_check->second.goal_idx < 0);
+    if (inc_exhausted_no_path) {
+        g_persistent_target_by_snake.erase(s.id);
+        g_persistent_target_is_power.erase(s.id);
+        invalidate_snake_target_cache(s.id);
+        return -1;
+    }
+
+    // Long-running stall without incremental path: restart incremental search
+    if (cache.stall_turns >= 20) {
+        // Force re-init incremental search from current position
+        istate.initialized = false;
+        cache.stall_turns = 0;
+    }
+
+    if (target_is_power && dist <= 6 && remaining_powerups > 1 && cache.same_target_turns >= 50) {
+        block_target_for_turns(s.id, target_pos, 10);
+        g_persistent_target_by_snake.erase(s.id);
+        g_persistent_target_is_power.erase(s.id);
+        invalidate_snake_target_cache(s.id);
+        return -1;
+    }
+
+    bool aligned = false;
+    if (cache.next_step == 0) aligned = (cache.expected_start_head == head_pos);
+    else if (cache.next_step - 1 < static_cast<int>(cache.expected_heads.size())) aligned = (cache.expected_heads[cache.next_step - 1] == head_pos);
+
+    if (!aligned && !cache.expected_heads.empty()) {
+        int scan_start = max(0, cache.next_step - 2);
+        int scan_end = min(static_cast<int>(cache.expected_heads.size()) - 1, cache.next_step + 16);
+        for (int i = scan_start; i <= scan_end; ++i) {
+            if (cache.expected_heads[i] == head_pos) {
+                cache.next_step = i + 1;
+                aligned = true;
+                break;
+            }
+        }
+    }
+
+    if (!aligned || cache.next_step >= static_cast<int>(cache.actions.size())) {
+        cache.actions.clear();
+        cache.expected_heads.clear();
+        cache.next_step = 0;
+        cache.expected_start_head = head_pos;
+        bool built = false;
+
+        // --- Incremental A* (primary planner, persists across turns) ---
+        if (!istate.initialized || istate.snake_id != s.id || istate.target_pos != target_pos) {
+            init_incremental_search(istate, state, s, target_pos);
+        }
+        // Continue the search for this turn's remaining budget
+        if (istate.goal_idx < 0 && !istate.exhausted) {
+            continue_incremental_search(istate, target_pos);
+        }
+        if (istate.goal_idx >= 0) {
+            built = extract_incremental_path(istate, cache.actions, cache.expected_heads);
+            if (built) {
+                // Resync: find current head in the extracted path
+                int sync_end = min((int)cache.expected_heads.size() - 1, 80);
+                for (int i = 0; i <= sync_end; ++i) {
+                    if (cache.expected_heads[i] == head_pos) {
+                        cache.next_step = i;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // --- Quick exact fallback (for short distances not yet handled by incremental) ---
+        if (!built && dist <= 20 && has_planner_time_budget(20)) {
+            built = build_exact_full_body_path_to_target(state, s, target_pos, cache.actions, cache.expected_heads);
+        }
+
+        // --- Head-only gravity fallback (immediate response while search continues) ---
+        if (!built) {
+            built = build_head_only_gravity_path_to_target(state, s, target_pos, cache.actions, cache.expected_heads);
+        }
+        if (!built) {
+            return -1;
+        }
+    }
+
+    if (cache.next_step >= static_cast<int>(cache.actions.size())) return -1;
+    return cache.actions[cache.next_step];
+}
+
+static void consume_cached_gravity_path_step(int snake_id) {
+    auto it = g_path_cache_by_snake.find(snake_id);
+    if (it == g_path_cache_by_snake.end()) return;
+    it->second.next_step++;
+}
+
+static int choose_support_cell_near_anchor(
+    const GameState& state,
+    int support_head,
+    int anchor_pos,
+    const unordered_set<int>& reserved_targets,
+    const DangerMapResult& danger
+) {
+    int best_pos = -1;
+    int best_score = -999999;
+    int dx[] = {0, 0, -1, 1};
+    int dy[] = {-1, 1, 0, 0};
+
+    int ax = anchor_pos % max_width;
+    int ay = anchor_pos / max_width;
+    for (int i = 0; i < 4; ++i) {
+        int nx = ax + dx[i];
+        int ny = ay + dy[i];
+        if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
+        int npos = ny * max_width + nx;
+        if (!is_reusable_target_cell(state, npos)) continue;
+        if (reserved_targets.count(npos)) continue;
+
+        int score = 0;
+        score -= manhattan_dist_pos(support_head, npos) * 100;
+        score -= static_cast<int>(danger.danger_map[npos]) * 300;
+
+        if (score > best_score) {
+            best_score = score;
+            best_pos = npos;
+        }
+    }
+
+    if (best_pos == -1 && is_reusable_target_cell(state, anchor_pos) && !reserved_targets.count(anchor_pos)) {
+        best_pos = anchor_pos;
+    }
+
+    if (best_pos == -1 && is_reusable_target_cell(state, support_head) && !reserved_targets.count(support_head)) {
+        best_pos = support_head;
+    }
+
+    return best_pos;
+}
+
+static TargetPlanResult assign_persistent_targets(
+    const GameState& state,
+    const vector<int>& powerup_positions,
+    const vector<SnakeRole>& base_roles,
+    const DangerMapResult& danger
+) {
+    TargetPlanResult result;
+    size_t n = state.my_snakes.size();
+    result.target_positions.assign(n, -1);
+    result.target_is_power.assign(n, false);
+
+    unordered_set<int> live_my_ids;
+    vector<size_t> alive_indexes;
+    for (size_t i = 0; i < n; ++i) {
+        const Snake& s = state.my_snakes[i];
+        if (!s.is_alive || s.length <= 0) continue;
+        live_my_ids.insert(s.id);
+        alive_indexes.push_back(i);
+    }
+
+    vector<int> stale_ids;
+    for (const auto& kv : g_persistent_target_by_snake) {
+        if (!live_my_ids.count(kv.first)) stale_ids.push_back(kv.first);
+    }
+    for (int id : stale_ids) {
+        g_persistent_target_by_snake.erase(id);
+        g_persistent_target_is_power.erase(id);
+        g_path_cache_by_snake.erase(id);
+    }
+
+    unordered_set<int> available_power(powerup_positions.begin(), powerup_positions.end());
+    unordered_set<int> reserved_targets;
+
+    vector<size_t> collector_indexes;
+    for (size_t i : alive_indexes) {
+        if (base_roles[i] == SnakeRole::Collector) collector_indexes.push_back(i);
+    }
+
+    if (powerup_positions.size() == 1 && !alive_indexes.empty()) {
+        collector_indexes.clear();
+        int single_power = powerup_positions[0];
+        int best_idx = static_cast<int>(alive_indexes[0]);
+        int best_dist = 999999;
+        for (size_t i : alive_indexes) {
+            const Snake& s = state.my_snakes[i];
+            int d = manhattan_dist_pos(s.body[s.head_idx], single_power);
+            if (d == 0) continue;
+            if (is_target_temporarily_blocked(s.id, single_power)) continue;
+            if (d < best_dist) {
+                best_dist = d;
+                best_idx = static_cast<int>(i);
+            }
+        }
+        if (best_dist < 999999) {
+            collector_indexes.push_back(static_cast<size_t>(best_idx));
+        }
+    } else if (collector_indexes.empty() && !powerup_positions.empty() && !alive_indexes.empty()) {
+        int best_idx = static_cast<int>(alive_indexes[0]);
+        int best_dist = 999999;
+        for (size_t i : alive_indexes) {
+            const Snake& s = state.my_snakes[i];
+            int head = s.body[s.head_idx];
+            for (int p : powerup_positions) {
+                int d = manhattan_dist_pos(head, p);
+                if (d == 0) continue;
+                if (is_target_temporarily_blocked(s.id, p)) continue;
+                if (d < best_dist) {
+                    best_dist = d;
+                    best_idx = static_cast<int>(i);
+                }
+            }
+        }
+        if (best_dist < 999999) {
+            collector_indexes.push_back(static_cast<size_t>(best_idx));
+        }
+    }
+
+    unordered_set<size_t> collector_index_set(collector_indexes.begin(), collector_indexes.end());
+
+    for (size_t i : collector_indexes) {
+        const Snake& s = state.my_snakes[i];
+        auto it = g_persistent_target_by_snake.find(s.id);
+        if (it == g_persistent_target_by_snake.end()) continue;
+        bool was_power = g_persistent_target_is_power[s.id];
+        int prev_target = it->second;
+        if (was_power && available_power.count(prev_target) && is_reusable_target_cell(state, prev_target) && !reserved_targets.count(prev_target) && !is_target_temporarily_blocked(s.id, prev_target)) {
+            int head = s.body[s.head_idx];
+            if (manhattan_dist_pos(head, prev_target) == 0) continue;
+            result.target_positions[i] = prev_target;
+            result.target_is_power[i] = true;
+            available_power.erase(prev_target);
+            reserved_targets.insert(prev_target);
+        }
+    }
+
+    for (size_t i : collector_indexes) {
+        if (result.target_positions[i] != -1) continue;
+        const Snake& s = state.my_snakes[i];
+        int head = s.body[s.head_idx];
+        int chosen = -1;
+        int best_dist = 999999;
+
+        if (!available_power.empty()) {
+            for (int p : available_power) {
+                int d = manhattan_dist_pos(head, p);
+                if (d == 0) continue;
+                if (is_target_temporarily_blocked(s.id, p)) continue;
+                if (d < best_dist) {
+                    best_dist = d;
+                    chosen = p;
+                }
+            }
+            if (chosen != -1) available_power.erase(chosen);
+        } else if (!powerup_positions.empty()) {
+            for (int p : powerup_positions) {
+                int d = manhattan_dist_pos(head, p);
+                if (d == 0) continue;
+                if (is_target_temporarily_blocked(s.id, p)) continue;
+                if (d < best_dist && !reserved_targets.count(p)) {
+                    best_dist = d;
+                    chosen = p;
+                }
+            }
+        }
+
+        if (chosen != -1) {
+            result.target_positions[i] = chosen;
+            result.target_is_power[i] = true;
+            reserved_targets.insert(chosen);
+        }
+    }
+
+    vector<size_t> support_indexes;
+    for (size_t i : alive_indexes) {
+        if (!collector_index_set.count(i)) support_indexes.push_back(i);
+    }
+
+    for (size_t i : support_indexes) {
+        const Snake& s = state.my_snakes[i];
+        auto it = g_persistent_target_by_snake.find(s.id);
+        if (it != g_persistent_target_by_snake.end()) {
+            int prev_target = it->second;
+            bool was_power = g_persistent_target_is_power[s.id];
+            if (!was_power && is_reusable_target_cell(state, prev_target) && !reserved_targets.count(prev_target)) {
+                result.target_positions[i] = prev_target;
+                result.target_is_power[i] = false;
+                reserved_targets.insert(prev_target);
+                continue;
+            }
+        }
+
+        int head = s.body[s.head_idx];
+        int anchor = -1;
+        int anchor_dist = 999999;
+
+        for (size_t ci : collector_indexes) {
+            int collector_target = result.target_positions[ci];
+            if (collector_target == -1) continue;
+            int d = manhattan_dist_pos(head, collector_target);
+            if (d < anchor_dist) {
+                anchor_dist = d;
+                anchor = collector_target;
+            }
+        }
+
+        if (anchor == -1 && !powerup_positions.empty()) {
+            for (int p : powerup_positions) {
+                int d = manhattan_dist_pos(head, p);
+                if (d < anchor_dist) {
+                    anchor_dist = d;
+                    anchor = p;
+                }
+            }
+        }
+
+        if (anchor == -1) {
+            anchor = head;
+        }
+
+        int support_target = choose_support_cell_near_anchor(state, head, anchor, reserved_targets, danger);
+        if (support_target != -1) {
+            result.target_positions[i] = support_target;
+            result.target_is_power[i] = false;
+            reserved_targets.insert(support_target);
+        }
+    }
+
+    for (size_t i : alive_indexes) {
+        const Snake& s = state.my_snakes[i];
+        int head = s.body[s.head_idx];
+        int tpos = result.target_positions[i];
+        if (tpos == -1 || tpos != head) continue;
+
+        if (result.target_is_power[i]) {
+            int chosen = -1;
+            int best_dist = 999999;
+            for (int p : powerup_positions) {
+                int d = manhattan_dist_pos(head, p);
+                if (d == 0) continue;
+                if (is_target_temporarily_blocked(s.id, p)) continue;
+                if (d < best_dist) {
+                    best_dist = d;
+                    chosen = p;
+                }
+            }
+            if (chosen != -1) {
+                result.target_positions[i] = chosen;
+                result.target_is_power[i] = true;
+            } else {
+                result.target_positions[i] = -1;
+                result.target_is_power[i] = false;
+            }
+        } else {
+            result.target_positions[i] = -1;
+            result.target_is_power[i] = false;
+        }
+    }
+
+    for (size_t i : alive_indexes) {
+        const Snake& s = state.my_snakes[i];
+        int tpos = result.target_positions[i];
+        if (tpos != -1) {
+            g_persistent_target_by_snake[s.id] = tpos;
+            g_persistent_target_is_power[s.id] = result.target_is_power[i];
+        }
+    }
+
+    return result;
+}
+static int delayed_powerup_risk_penalty(const GameState& state, int snake_id, int initial_action, int horizon_steps) {
+    if (horizon_steps <= 0) return 0;
+    int my_idx = find_my_snake_index(state, snake_id);
+    if (my_idx == -1) return 0;
+
+    GameState probe = state;
+    vector<int> my_actions = infer_default_actions(probe.my_snakes);
+    vector<int> opp_actions = infer_default_actions(probe.opp_snakes);
+    my_actions[my_idx] = initial_action;
+    probe.simulate(my_actions, opp_actions);
+
+    const Snake* me = probe.find_my_snake_by_id(snake_id);
+    if (me == nullptr || !me->is_alive) {
+        return BotTuning::DELAYED_DEATH_PENALTY;
+    }
+
+    int penalty = 0;
+    for (int step = 0; step < horizon_steps; ++step) {
+        if (out_of_time()) break;
+
+        me = probe.find_my_snake_by_id(snake_id);
+        if (me == nullptr || !me->is_alive) {
+            penalty += BotTuning::DELAYED_DEATH_PENALTY;
+            break;
+        }
+
+        int followups = probe.count_safe_followups(*me);
+        if (followups == 0) penalty += BotTuning::DELAYED_NO_FOLLOWUP_PENALTY;
+        else if (followups == 1) penalty += BotTuning::DELAYED_LOW_FOLLOWUP_PENALTY;
+
+        int head = me->body[me->head_idx];
+        int hx = head % max_width;
+        int hy = head / max_width;
+        int best_a = -1;
+        int best_eval = -999999;
+        int dx[] = {0, 0, -1, 1};
+        int dy[] = {-1, 1, 0, 0};
+
+        for (int a = 0; a < 4; ++a) {
+            if (is_backward_action(*me, a)) continue;
+            int nx = hx + dx[a];
+            int ny = hy + dy[a];
+            if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
+            int npos = ny * max_width + nx;
+            int16_t cell = probe.grid[npos];
+            if (cell == CELL_WALL || cell >= CELL_SNAKE_BASE) continue;
+
+            GameState next_probe = probe;
+            vector<int> m_actions = infer_default_actions(next_probe.my_snakes);
+            vector<int> o_actions = infer_default_actions(next_probe.opp_snakes);
+            int nidx = find_my_snake_index(next_probe, snake_id);
+            if (nidx == -1) continue;
+            m_actions[nidx] = a;
+            next_probe.simulate(m_actions, o_actions);
+            const Snake* nme = next_probe.find_my_snake_by_id(snake_id);
+            if (nme == nullptr || !nme->is_alive) continue;
+
+            int eval = next_probe.count_safe_followups(*nme) * 1000;
+            if (next_probe.has_adjacent_powerup(nme->body[nme->head_idx])) eval += 1200;
+            if (eval > best_eval) {
+                best_eval = eval;
+                best_a = a;
+            }
+        }
+
+        if (best_a == -1) {
+            penalty += BotTuning::DELAYED_NO_FOLLOWUP_PENALTY;
+            break;
+        }
+
+        vector<int> m_actions = infer_default_actions(probe.my_snakes);
+        vector<int> o_actions = infer_default_actions(probe.opp_snakes);
+        int nidx = find_my_snake_index(probe, snake_id);
+        if (nidx == -1) {
+            penalty += BotTuning::DELAYED_DEATH_PENALTY;
+            break;
+        }
+        m_actions[nidx] = best_a;
+        probe.simulate(m_actions, o_actions);
+    }
+
+    return penalty;
+}
+
 static int evaluate_local_combat(
     const GameState& state,
     int my_snake_id,
@@ -791,12 +1933,12 @@ static int evaluate_local_combat(
     if (opp == nullptr || !opp->is_alive) return 70000;
 
     int score = 0;
-    score += (self->length - opp->length) * 140;
+    score += (self->length - opp->length) * BotTuning::LOCAL_COMBAT_LENGTH_WEIGHT;
 
     int my_lost = max(0, root_my_length - self->length);
     int opp_lost = max(0, root_opp_length - opp->length);
-    score -= my_lost * 220;
-    score += opp_lost * 220;
+    score -= my_lost * BotTuning::LOCAL_COMBAT_LOST_SEGMENT_WEIGHT;
+    score += opp_lost * BotTuning::LOCAL_COMBAT_LOST_SEGMENT_WEIGHT;
 
     int my_head = self->body[self->head_idx];
     int opp_head = opp->body[opp->head_idx];
@@ -806,8 +1948,8 @@ static int evaluate_local_combat(
     int opp_hy = opp_head / max_width;
     int hdist = abs(my_hx - opp_hx) + abs(my_hy - opp_hy);
 
-    if (hdist <= 1) score += 500;
-    score -= hdist * 20;
+    if (hdist <= 1) score += BotTuning::LOCAL_COMBAT_H2H_BONUS;
+    score -= hdist * BotTuning::LOCAL_COMBAT_HDIST_PENALTY;
 
     return score;
 }
@@ -919,10 +2061,16 @@ static int local_alpha_beta_value(
     return best;
 }
 
-static int choose_local_alpha_beta_action(const GameState& state, int my_snake_id, int depth) {
+static int choose_local_alpha_beta_action_depth(const GameState& state, int my_snake_id, int depth, bool& completed_depth) {
     const Snake* self = state.find_my_snake_by_id(my_snake_id);
-    if (self == nullptr || !self->is_alive) return -1;
-    if (state.opp_snakes.empty()) return -1;
+    if (self == nullptr || !self->is_alive) {
+        completed_depth = false;
+        return -1;
+    }
+    if (state.opp_snakes.empty()) {
+        completed_depth = false;
+        return -1;
+    }
 
     int my_head = self->body[self->head_idx];
     int my_hx = my_head % max_width;
@@ -941,18 +2089,28 @@ static int choose_local_alpha_beta_action(const GameState& state, int my_snake_i
     }
 
     const Snake* target_opp = state.find_opp_snake_by_id(target_opp_id);
-    if (target_opp == nullptr || !target_opp->is_alive) return -1;
+    if (target_opp == nullptr || !target_opp->is_alive) {
+        completed_depth = false;
+        return -1;
+    }
 
     int my_idx = find_my_snake_index(state, my_snake_id);
-    if (my_idx == -1) return -1;
+    if (my_idx == -1) {
+        completed_depth = false;
+        return -1;
+    }
 
     vector<int> default_my_actions = infer_default_actions(state.my_snakes);
     vector<int> default_opp_actions = infer_default_actions(state.opp_snakes);
     int opp_idx = find_opp_snake_index(state, target_opp_id);
-    if (opp_idx == -1) return -1;
+    if (opp_idx == -1) {
+        completed_depth = false;
+        return -1;
+    }
 
     int best_action = -1;
     int best_value = -999999;
+    bool interrupted = false;
 
     int dx[] = {0, 0, -1, 1};
     int dy[] = {-1, 1, 0, 0};
@@ -960,7 +2118,10 @@ static int choose_local_alpha_beta_action(const GameState& state, int my_snake_i
     int sy = my_hy;
 
     for (int a = 0; a < 4; ++a) {
-        if (out_of_time()) break;
+        if (out_of_time()) {
+            interrupted = true;
+            break;
+        }
         if (is_backward_action(*self, a)) continue;
 
         int nx = sx + dx[a];
@@ -977,7 +2138,10 @@ static int choose_local_alpha_beta_action(const GameState& state, int my_snake_i
         int oy = target_opp->body[target_opp->head_idx] / max_width;
 
         for (int opp_a = 0; opp_a < 4; ++opp_a) {
-            if (out_of_time()) break;
+            if (out_of_time()) {
+                interrupted = true;
+                break;
+            }
             if (is_backward_action(*target_opp, opp_a)) continue;
 
             int onx = ox + dx[opp_a];
@@ -1008,6 +2172,8 @@ static int choose_local_alpha_beta_action(const GameState& state, int my_snake_i
             worst = min(worst, v);
         }
 
+        if (interrupted) break;
+
         if (worst == 999999) {
             GameState next_state = state;
             vector<int> sim_my_actions = default_my_actions;
@@ -1024,7 +2190,29 @@ static int choose_local_alpha_beta_action(const GameState& state, int my_snake_i
         }
     }
 
+    completed_depth = !interrupted;
     return best_action;
+}
+
+static int choose_local_alpha_beta_action_iterative(const GameState& state, int my_snake_id, int min_depth, int max_depth) {
+    int fallback_action = -1;
+    int last_completed_action = -1;
+
+    for (int depth = min_depth; depth <= max_depth; ++depth) {
+        if (out_of_time()) break;
+        bool completed_depth = false;
+        int action = choose_local_alpha_beta_action_depth(state, my_snake_id, depth, completed_depth);
+        if (action != -1) {
+            fallback_action = action;
+            if (completed_depth) {
+                last_completed_action = action;
+            }
+        }
+        if (!completed_depth) break;
+    }
+
+    if (last_completed_action != -1) return last_completed_action;
+    return fallback_action;
 }
 
 static int min_steps_to_powerup_gain(const GameState& state, int snake_id, int start_length, int depth_left) {
@@ -1139,53 +2327,65 @@ static int first_action_to_powerup_gain(const GameState& state, int snake_id, in
     return best_steps < 999999 ? best_action : -1;
 }
 
-#ifdef LOCAL_TEST
-void run_local_tests() {
-    cerr << "Running local memory constraint and cloning tests..." << endl;
-    
-    // Run mock grid allocation test
-    world_width = 20;
-    world_height = 20;
-    total_powerups_count = 10;
-    
-    max_len = 3 + total_powerups_count;
-    max_width = (2 * max_len) + world_width;
-    max_height = world_height + 2 * max_len;
-    grid_size = max_width * max_height;
-    
-    GameState root_state;
-    root_state.grid.assign(grid_size, CELL_EMPTY);
-    
-    Snake s1;
-    s1.id = 0; s1.is_alive = true; s1.length = 3; s1.head_idx = 0; s1.tail_idx = 2;
-    s1.body.assign(max_len, -1);
-    s1.body[0] = 5 * max_width + 5;
-    s1.body[1] = 5 * max_width + 6;
-    s1.body[2] = 5 * max_width + 7;
-    root_state.my_snakes.push_back(s1);
-    
-    auto t1 = high_resolution_clock::now();
-    int iterations = 10000;
-    for(int i = 0; i < iterations; i++) {
-        GameState copy = root_state;
-        vector<int> my_acts = {1}; // DOWN
-        vector<int> opp_acts = {};
-        copy.simulate(my_acts, opp_acts);
+// BFS shortest path from given snake's head to target_pos.
+// Returns the first action (0=UP 1=DOWN 2=LEFT 3=RIGHT) to take, or -1 if
+// no path exists or the target is already at the head position.
+// Only navigates through playable cells (not padding zones).
+static int bfs_first_action_to_cell(const GameState& state, const Snake& s, int target_pos) {
+    if (target_pos < 0 || target_pos >= grid_size) return -1;
+    int head_pos = s.body[s.head_idx];
+    if (head_pos == target_pos) return -1; // already there — caller decides what to do
+
+    int dx[] = {0, 0, -1, 1};
+    int dy[] = {-1, 1, 0, 0};
+    int hx = head_pos % max_width;
+    int hy = head_pos / max_width;
+
+    // first_dir[pos] = first action taken from head to reach pos (-1 = unvisited)
+    vector<int8_t> first_dir(grid_size, -1);
+    queue<int> q;
+
+    // Seed with direct neighbours
+    for (int a = 0; a < 4; ++a) {
+        if (is_backward_action(s, a)) continue;
+        int nx = hx + dx[a];
+        int ny = hy + dy[a];
+        if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
+        int n_pos = ny * max_width + nx;
+        if (!is_playable_cell(n_pos)) continue; // stay within playable area only
+        int16_t cell = state.grid[n_pos];
+        if (cell == CELL_WALL || cell >= CELL_SNAKE_BASE) continue;
+        if (n_pos == target_pos) return a; // one step away
+        if (first_dir[n_pos] != -1) continue;
+        first_dir[n_pos] = static_cast<int8_t>(a);
+        q.push(n_pos);
     }
-    auto t2 = high_resolution_clock::now();
-    auto ms_taken = duration_cast<milliseconds>(t2 - t1).count();
-    
-    cerr << "Simulated " << iterations << " branches in " << ms_taken << "ms" << endl;
-    cerr << "Avg time per clone+simulate: " << (float)ms_taken / iterations << "ms" << endl;
-    
-    if ((float)ms_taken/iterations < 0.1f) {
-        cerr << "[PASS] Target < 0.1ms achieved" << endl;
-    } else {
-        cerr << "[WARN] Target < 0.1ms missed" << endl;
+
+    while (!q.empty()) {
+        if (out_of_time()) return -1;
+        int pos = q.front(); q.pop();
+        int px = pos % max_width;
+        int py = pos / max_width;
+        int8_t fd = first_dir[pos];
+
+        for (int a = 0; a < 4; ++a) {
+            int nx = px + dx[a];
+            int ny = py + dy[a];
+            if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
+            int n_pos = ny * max_width + nx;
+            if (first_dir[n_pos] != -1) continue;
+            if (!is_playable_cell(n_pos)) continue; // stay within playable area only
+            int16_t cell = state.grid[n_pos];
+            if (cell == CELL_WALL || cell >= CELL_SNAKE_BASE) continue;
+            if (n_pos == target_pos) return static_cast<int>(fd); // found
+            first_dir[n_pos] = fd;
+            q.push(n_pos);
+        }
     }
-    exit(0);
+    return -1; // no path
 }
-#endif
+
+
 
 int main() {
     signal(SIGSEGV, crash_signal_handler);
@@ -1198,34 +2398,29 @@ int main() {
 #endif
     int my_id;
     cin >> my_id;
-    cin.ignore();
     cin >> world_width;
-    cin.ignore();
     cin >> world_height;
-    cin.ignore();
 
     // In the first turn, we don't know total powerups yet, but we read the initial state.
     // Let's store the initial rows to parse them later once we know the dimensions.
     vector<string> initial_rows(world_height);
+    cin >> ws;
     for (int i = 0; i < world_height; i++) {
         getline(cin, initial_rows[i]);
     }
     
     int snakebots_per_player;
     cin >> snakebots_per_player;
-    cin.ignore();
     
     vector<int> my_snakebots;
     int my_snakebot_id;
     for (int i = 0; i < snakebots_per_player; i++) {
         cin >> my_snakebot_id;
-        cin.ignore();
         my_snakebots.push_back(my_snakebot_id);
     }
     int opp_snakebot_id;
     for (int i = 0; i < snakebots_per_player; i++) {
         cin >> opp_snakebot_id;
-        cin.ignore();
     }
     
     // Commands array and counter omitted for logic bot
@@ -1239,6 +2434,7 @@ int main() {
     auto loop_start = high_resolution_clock::now();  // Global loop start
     while (1) {
         counter++;
+        g_turn_counter = counter;
         auto iter_start = high_resolution_clock::now();  // Per-iteration start
         turn_start_time = iter_start;
         
@@ -1246,7 +2442,6 @@ int main() {
         if (!(cin >> power_source_count)) {
             break;
         }
-        cin.ignore();
 
         if (is_first_turn) {
             total_powerups_count = power_source_count;
@@ -1293,7 +2488,6 @@ int main() {
             int x = 0;
             int y = 0;
             cin >> x >> y;
-            cin.ignore();
             
             int sx = max_len + x;
             int sy = max_len + y;
@@ -1302,7 +2496,6 @@ int main() {
 
         int snakebot_count = 0;
         cin >> snakebot_count;
-        cin.ignore();
         
         // Reset dynamic snake states arrays since we overwrite parsed data
         state.my_snakes.clear();
@@ -1314,7 +2507,6 @@ int main() {
             if (!(cin >> snakebot_id >> body_str)) {
                 break;
             }
-            cin.ignore();
 
             Snake s;
             s.id = snakebot_id;
@@ -1362,8 +2554,6 @@ int main() {
             }
         }
 
-        // --- DEBUG Dump Grid State on Turn 1 --- (Removed to save ms)
-
         // --- DECISION LOGIC ---
         
         // 1. Calculate Voronoi board control
@@ -1378,8 +2568,9 @@ int main() {
             }
         }
 
-        DangerMapResult danger = build_enemy_danger_map(state, 2);
+        DangerMapResult danger = build_enemy_danger_map(state, BotTuning::DANGER_MAP_PROJECTION_DEPTH);
         vector<SnakeRole> snake_roles = assign_dynamic_roles(state, powerup_positions, counter);
+        TargetPlanResult target_plan = assign_persistent_targets(state, powerup_positions, snake_roles, danger);
 
         auto manhattan = [](int p1, int p2) {
             int x1 = p1 % max_width;
@@ -1402,6 +2593,20 @@ int main() {
         }
         int dx[] = {0, 0, -1, 1};
         int dy[] = {-1, 1, 0, 0};
+
+        auto append_action_with_target = [&](size_t idx, int action) {
+            const Snake& snake = state.my_snakes[idx];
+            string cmd = to_string(snake.id) + " " + action_to_string(action);
+            if (idx < target_plan.target_positions.size()) {
+                int target_pos = target_plan.target_positions[idx];
+                if (target_pos >= 0) {
+                    int tx = (target_pos % max_width) - max_len;
+                    int ty = (target_pos / max_width) - max_len;
+                    cmd += " " + to_string(tx) + " " + to_string(ty);
+                }
+            }
+            action_strs.push_back(cmd);
+        };
         
         for (size_t s_idx = 0; s_idx < state.my_snakes.size(); ++s_idx) {
             Snake& s = state.my_snakes[s_idx];
@@ -1414,6 +2619,8 @@ int main() {
             int best_action = fallback_action;
             int best_score = -999999;
             SnakeRole role = snake_roles[s_idx];
+            int target_pos = (s_idx < target_plan.target_positions.size()) ? target_plan.target_positions[s_idx] : -1;
+            bool target_is_power = (s_idx < target_plan.target_is_power.size()) ? target_plan.target_is_power[s_idx] : false;
             bool overlap_enemy_danger = (head_pos >= 0 && head_pos < grid_size && danger.danger_map[head_pos] > 0);
             int nearest_enemy_head_dist = 999999;
             for (const auto& opp : state.opp_snakes) {
@@ -1425,21 +2632,58 @@ int main() {
 
             if (out_of_time()) {
                 current_my_actions[s_idx] = fallback_action;
-                action_strs.push_back(to_string(s.id) + " " + action_to_string(fallback_action));
+                append_action_with_target(s_idx, fallback_action);
                 continue;
             }
 
             if (overlap_enemy_danger && danger.danger_map[head_pos] >= danger.high_risk_threshold && nearest_enemy_head_dist <= 5 && !out_of_time()) {
-                int local_depth = (state.my_snakes.size() > 1) ? 2 : 3;
-                int local_ab_action = choose_local_alpha_beta_action(state, s.id, local_depth);
+                int local_min_depth = 2;
+                int local_max_depth = (state.my_snakes.size() > 1) ? 4 : 6;
+                int local_ab_action = choose_local_alpha_beta_action_iterative(state, s.id, local_min_depth, local_max_depth);
                 if (local_ab_action != -1) {
                     current_my_actions[s_idx] = local_ab_action;
-                    action_strs.push_back(to_string(s.id) + " " + action_to_string(local_ab_action));
+                    append_action_with_target(s_idx, local_ab_action);
                     continue;
                 }
             }
 
-            if (powerup_positions.size() == 1 && (!overlap_enemy_danger || nearest_enemy_head_dist > 3)) {
+            // --- BFS DIRECT PATH TO ASSIGNED TARGET ---
+            // When a target is assigned and no emergency is active, use BFS to
+            // find and follow the shortest path directly rather than relying on
+            // the weak manhattan gradient in the scoring loop.
+            if (target_pos != -1 && !out_of_time() && nearest_enemy_head_dist > 2) {
+                int bfs_action = bfs_first_action_to_cell(state, s, target_pos);
+                if (bfs_action != -1 && !is_backward_action(s, bfs_action)) {
+                    int bnx = hx + dx[bfs_action];
+                    int bny = hy + dy[bfs_action];
+                    int bpos = bny * max_width + bnx;
+                    bool bfs_safe = true;
+                    int bfs_danger = (bpos >= 0 && bpos < grid_size) ? static_cast<int>(danger.danger_map[bpos]) : 0;
+                    bool bfs_critical = (state.grid[bpos] == CELL_POWERUP && v_res.length_delta < 0);
+                    if (bfs_danger >= danger.high_risk_threshold && !bfs_critical && nearest_enemy_head_dist <= 5)
+                        bfs_safe = false;
+                    if (bfs_safe && !state.survives_flood_fill(bpos, max(2, s.length / 2)))
+                        bfs_safe = false;
+                    if (bfs_safe && !out_of_time()) {
+                        GameState bfs_next_state = state;
+                        vector<int> bfs_my_actions = default_my_actions;
+                        bfs_my_actions[s_idx] = bfs_action;
+                        bfs_next_state.simulate(bfs_my_actions, default_opp_actions);
+                        const Snake* bfs_next_self = bfs_next_state.find_my_snake_by_id(s.id);
+                        if (bfs_next_self == nullptr || !bfs_next_self->is_alive)
+                            bfs_safe = false;
+                        else if (bfs_next_state.count_safe_followups(*bfs_next_self) == 0)
+                            bfs_safe = false;
+                    }
+                    if (bfs_safe) {
+                        current_my_actions[s_idx] = bfs_action;
+                        append_action_with_target(s_idx, bfs_action);
+                        continue;
+                    }
+                }
+            }
+
+            if (target_is_power && powerup_positions.size() == 1 && (!overlap_enemy_danger || nearest_enemy_head_dist > 3)) {
                 int apple_pos = powerup_positions[0];
                 int ax = apple_pos % max_width;
                 int ay = apple_pos / max_width;
@@ -1449,7 +2693,7 @@ int main() {
                     int16_t up_cell = state.grid[up_pos];
                     if (!is_backward_action(s, 0) && up_cell != CELL_WALL && up_cell < CELL_SNAKE_BASE) {
                         current_my_actions[s_idx] = 0;
-                        action_strs.push_back(to_string(s.id) + " " + action_to_string(0));
+                        append_action_with_target(s_idx, 0);
                         continue;
                     }
                     if (hx > ax) {
@@ -1457,20 +2701,20 @@ int main() {
                         int16_t left_cell = state.grid[left_pos];
                         if (!is_backward_action(s, 2) && left_cell != CELL_WALL && left_cell < CELL_SNAKE_BASE) {
                             current_my_actions[s_idx] = 2;
-                            action_strs.push_back(to_string(s.id) + " " + action_to_string(2));
+                            append_action_with_target(s_idx, 2);
                             continue;
                         }
                     }
                 }
                 if (ax == hx && ay < hy) {
                     current_my_actions[s_idx] = 0;
-                    action_strs.push_back(to_string(s.id) + " " + action_to_string(0));
+                    append_action_with_target(s_idx, 0);
                     continue;
                 }
                 if (ay == hy - 1 && abs(ax - hx) == 1) {
                     int tactical_action = (ax < hx) ? 2 : 3;
                     current_my_actions[s_idx] = tactical_action;
-                    action_strs.push_back(to_string(s.id) + " " + action_to_string(tactical_action));
+                    append_action_with_target(s_idx, tactical_action);
                     continue;
                 }
                 if (map_has_open_left_edge && !map_has_open_floor_edge && ax <= max_len + 1 && hx <= map_mid_x) {
@@ -1481,7 +2725,7 @@ int main() {
                         int16_t next_cell = state.grid[n_pos];
                         if (!is_backward_action(s, 0) && next_cell != CELL_WALL && next_cell < CELL_SNAKE_BASE) {
                             current_my_actions[s_idx] = 0;
-                            action_strs.push_back(to_string(s.id) + " " + action_to_string(0));
+                            append_action_with_target(s_idx, 0);
                             continue;
                         }
                     }
@@ -1492,7 +2736,7 @@ int main() {
                         int16_t next_cell = state.grid[n_pos];
                         if (!is_backward_action(s, 2) && next_cell != CELL_WALL && next_cell < CELL_SNAKE_BASE) {
                             current_my_actions[s_idx] = 2;
-                            action_strs.push_back(to_string(s.id) + " " + action_to_string(2));
+                            append_action_with_target(s_idx, 2);
                             continue;
                         }
                     }
@@ -1503,14 +2747,14 @@ int main() {
                         int16_t next_cell = state.grid[n_pos];
                         if (!is_backward_action(s, 0) && next_cell != CELL_WALL && next_cell < CELL_SNAKE_BASE) {
                             current_my_actions[s_idx] = 0;
-                            action_strs.push_back(to_string(s.id) + " " + action_to_string(0));
+                            append_action_with_target(s_idx, 0);
                             continue;
                         }
                     }
                 }
             }
 
-            if (!powerup_positions.empty() && !out_of_time()) {
+            if (target_is_power && !powerup_positions.empty() && !out_of_time()) {
                 GameState local_plan_state = state;
                 local_plan_state.opp_snakes.clear();
                 bool open_edge_map = map_has_open_left_edge || map_has_open_right_edge || map_has_open_floor_edge;
@@ -1538,11 +2782,52 @@ int main() {
                         }
                     }
 
+                    if (tactical_acceptable && !out_of_time()) {
+                        int delayed_penalty = delayed_powerup_risk_penalty(state, s.id, tactical_action, 3);
+                        if (delayed_penalty >= BotTuning::DELAYED_DEATH_PENALTY || delayed_penalty >= 2 * BotTuning::DELAYED_LOW_FOLLOWUP_PENALTY) {
+                            tactical_acceptable = false;
+                        }
+                    }
+
                     if (tactical_acceptable) {
                         current_my_actions[s_idx] = tactical_action;
-                        action_strs.push_back(to_string(s.id) + " " + action_to_string(tactical_action));
+                        append_action_with_target(s_idx, tactical_action);
                         continue;
                     }
+                }
+            }
+
+            if (target_is_power && target_pos != -1 && nearest_enemy_head_dist > 2 && !out_of_time()) {
+                int cached_action = cached_gravity_path_action(state, s, target_pos, true);
+                if (cached_action != -1 && !is_backward_action(s, cached_action)) {
+                    int cnx = hx + dx[cached_action];
+                    int cny = hy + dy[cached_action];
+                    int cpos = cny * max_width + cnx;
+                    bool cached_safe = true;
+                    int cached_danger = (cpos >= 0 && cpos < grid_size) ? static_cast<int>(danger.danger_map[cpos]) : 0;
+                    bool cached_critical = (cpos >= 0 && cpos < grid_size && state.grid[cpos] == CELL_POWERUP && v_res.length_delta < 0);
+                    if (cached_danger >= danger.high_risk_threshold && !cached_critical && nearest_enemy_head_dist <= 5)
+                        cached_safe = false;
+                    if (cached_safe && !state.survives_flood_fill(cpos, max(2, s.length / 2)))
+                        cached_safe = false;
+                    if (cached_safe && !out_of_time()) {
+                        GameState cached_next_state = state;
+                        vector<int> cached_my_actions = default_my_actions;
+                        cached_my_actions[s_idx] = cached_action;
+                        cached_next_state.simulate(cached_my_actions, default_opp_actions);
+                        const Snake* cached_next_self = cached_next_state.find_my_snake_by_id(s.id);
+                        if (cached_next_self == nullptr || !cached_next_self->is_alive)
+                            cached_safe = false;
+                        else if (cached_next_state.count_safe_followups(*cached_next_self) == 0)
+                            cached_safe = false;
+                    }
+                    if (cached_safe) {
+                        current_my_actions[s_idx] = cached_action;
+                        append_action_with_target(s_idx, cached_action);
+                        consume_cached_gravity_path_step(s.id);
+                        continue;
+                    }
+                    invalidate_snake_target_cache(s.id);
                 }
             }
 
@@ -1566,16 +2851,16 @@ int main() {
                 int danger_weight = (n_pos >= 0 && n_pos < grid_size) ? static_cast<int>(danger.danger_map[n_pos]) : 0;
 
                 if (danger_weight >= danger.high_risk_threshold && !critical_objective) {
-                    score -= 14000 + danger_weight * 1200;
+                    score -= BotTuning::DANGER_HARD_BASE_PENALTY + danger_weight * BotTuning::DANGER_HARD_WEIGHT;
                 } else {
-                    score -= danger_weight * 600;
+                    score -= danger_weight * BotTuning::DANGER_SOFT_WEIGHT;
                 }
 
                 // Survive constraints first.
                 if (!state.survives_flood_fill(n_pos, max(2, s.length / 2))) {
-                    score -= 20000;
+                    score -= BotTuning::FLOODFILL_DEATH_PENALTY;
                 } else {
-                    score += 200;
+                    score += BotTuning::FLOODFILL_SURVIVE_BONUS;
                 }
 
                 bool defensive_mode = (s.length >= 4 && v_res.length_delta >= 0);
@@ -1584,10 +2869,19 @@ int main() {
                 if (next_cell == CELL_POWERUP) {
                     bool enclosed_map = !map_has_open_left_edge && !map_has_open_right_edge && !map_has_open_floor_edge;
                     if (enclosed_map && total_powerups_count == 2 && s.length >= 4) {
-                        score -= 100000;
+                        score -= BotTuning::ENCLOSED_POWERUP_PENALTY;
                     } else {
-                        score += 32000;
+                        score += BotTuning::POWERUP_BONUS;
                     }
+                }
+
+                if (target_pos != -1) {
+                    int target_dist_after = manhattan(n_pos, target_pos);
+                    int target_weight = (target_is_power || role == SnakeRole::Collector)
+                        ? BotTuning::TARGET_COLLECTOR_DIST_WEIGHT
+                        : BotTuning::TARGET_SUPPORT_DIST_WEIGHT;
+                    score -= target_dist_after * target_weight;
+                    if (target_dist_after == 0) score += BotTuning::TARGET_REACHED_BONUS;
                 }
 
                 // Exclusive / contested heuristic proxy using distances to all heads.
@@ -1613,9 +2907,9 @@ int main() {
                 }
 
                 // Strategic mode (length delta) from Voronoi summary.
-                score += v_res.length_delta * 50;
-                score += v_res.my_exclusive_powerups * 20;
-                score -= v_res.opp_exclusive_powerups * 20;
+                score += v_res.length_delta * BotTuning::VORONOI_LENGTH_DELTA_WEIGHT;
+                score += v_res.my_exclusive_powerups * BotTuning::VORONOI_MY_EXCLUSIVE_WEIGHT;
+                score -= v_res.opp_exclusive_powerups * BotTuning::VORONOI_OPP_EXCLUSIVE_WEIGHT;
 
                 int nearest_enemy_now = 999999;
                 int nearest_enemy_after = 999999;
@@ -1644,20 +2938,47 @@ int main() {
                 }
 
                 if (role == SnakeRole::Collector) {
-                    if (next_cell == CELL_POWERUP) score += 7000;
-                    if (nearest_enemy_after <= 2) score -= 2200;
+                    if (next_cell == CELL_POWERUP) score += BotTuning::ROLE_COLLECTOR_POWER_BONUS;
+                    if (nearest_enemy_after <= 2) score -= BotTuning::ROLE_COLLECTOR_NEAR_ENEMY_PENALTY;
                 } else if (role == SnakeRole::Support) {
-                    if (nearest_ally_after < 999999) score += max(0, 1800 - nearest_ally_after * 350);
-                    if (next_cell == CELL_POWERUP && nearest_ally_after <= 2) score -= 1400;
+                    if (nearest_ally_after < 999999) {
+                        score += max(0, BotTuning::ROLE_SUPPORT_NEAR_ALLY_BONUS - nearest_ally_after * BotTuning::ROLE_SUPPORT_NEAR_ALLY_FALLOFF);
+                    }
+                    if (next_cell == CELL_POWERUP && nearest_ally_after <= 2) score -= BotTuning::ROLE_SUPPORT_POWER_NEAR_ALLY_PENALTY;
+
+                    int collect_target = -1;
+                    int best_collect_dist = 999999;
+                    for (size_t ally_idx = 0; ally_idx < state.my_snakes.size(); ++ally_idx) {
+                        if (ally_idx == s_idx) continue;
+                        if (ally_idx >= snake_roles.size() || snake_roles[ally_idx] != SnakeRole::Collector) continue;
+                        if (ally_idx >= target_plan.target_positions.size() || ally_idx >= target_plan.target_is_power.size()) continue;
+                        if (!target_plan.target_is_power[ally_idx]) continue;
+                        int at = target_plan.target_positions[ally_idx];
+                        if (at == -1) continue;
+                        int ally_head = state.my_snakes[ally_idx].body[state.my_snakes[ally_idx].head_idx];
+                        int d = manhattan(ally_head, at);
+                        if (d < best_collect_dist) {
+                            best_collect_dist = d;
+                            collect_target = at;
+                        }
+                    }
+                    if (collect_target != -1 && best_collect_dist <= 1) {
+                        int now_dist = manhattan(head_pos, collect_target);
+                        int after_dist = manhattan(n_pos, collect_target);
+                        if (after_dist > now_dist) score += BotTuning::SUPPORT_ROTATE_AWAY_BONUS;
+                        if (after_dist <= 1) score -= BotTuning::SUPPORT_STAY_NEAR_COLLECT_PENALTY;
+                    }
                 } else if (role == SnakeRole::Defender) {
-                    if (nearest_enemy_after <= 4) score += 1600;
-                    if (nearest_enemy_after > nearest_enemy_now) score -= 900;
+                    if (nearest_enemy_after <= 4) score += BotTuning::ROLE_DEFENDER_ENEMY_PROX_BONUS;
+                    if (nearest_enemy_after > nearest_enemy_now) score -= BotTuning::ROLE_DEFENDER_RETREAT_PENALTY;
                 } else if (role == SnakeRole::Suffocator) {
-                    if (nearest_enemy_after < nearest_enemy_now) score += 1500;
-                    if (nearest_enemy_after <= 1) score += 700;
+                    if (nearest_enemy_after < nearest_enemy_now) score += BotTuning::ROLE_SUFFOCATOR_APPROACH_BONUS;
+                    if (nearest_enemy_after <= 1) score += BotTuning::ROLE_SUFFOCATOR_CLOSE_BONUS;
                 } else if (role == SnakeRole::Killer) {
-                    if (nearest_short_enemy_after < 999999) score += max(0, 2800 - nearest_short_enemy_after * 600);
-                    if (next_cell == CELL_POWERUP) score -= 800;
+                    if (nearest_short_enemy_after < 999999) {
+                        score += max(0, BotTuning::ROLE_KILLER_SHORT_ENEMY_BONUS - nearest_short_enemy_after * BotTuning::ROLE_KILLER_SHORT_ENEMY_FALLOFF);
+                    }
+                    if (next_cell == CELL_POWERUP) score -= BotTuning::ROLE_KILLER_POWER_PENALTY;
                 }
 
                 // Small wall-avoidance and center preference using playable-board coordinates.
@@ -1675,45 +2996,35 @@ int main() {
 
                     const Snake* next_self = next_state.find_my_snake_by_id(s.id);
                     if (next_self == nullptr || !next_self->is_alive) {
-                        score -= 50000;
+                        score -= BotTuning::SIM_DEATH_PENALTY;
                     } else {
                         int simulated_head_pos = next_self->body[next_self->head_idx];
                         int shx = simulated_head_pos % max_width;
                         int shy = simulated_head_pos / max_width;
                         if (shx < max_len || shx >= max_len + world_width) {
-                            score -= 35000;
+                            score -= BotTuning::SIDE_EXIT_PENALTY;
                         }
                         if (shy >= max_len + world_height) {
-                            score -= 50000;
+                            score -= BotTuning::FLOOR_EXIT_PENALTY;
                         }
                         if (map_has_open_left_edge && hx == max_len && a == 2) {
-                            score -= 25000;
+                            score -= BotTuning::OPEN_EDGE_EXIT_PENALTY;
                         }
                         if (map_has_open_right_edge && hx == max_len + world_width - 1 && a == 3) {
-                            score -= 25000;
+                            score -= BotTuning::OPEN_EDGE_EXIT_PENALTY;
                         }
 
                         int followups = next_state.count_safe_followups(*next_self);
-                        score += followups * 3000;
-                        if (followups == 0) score -= 20000;
-                        if (followups == 1) score -= 9000;
+                        score += followups * BotTuning::FOLLOWUP_COUNT_WEIGHT;
+                        if (followups == 0) score -= BotTuning::FOLLOWUP_ZERO_PENALTY;
+                        if (followups == 1) score -= BotTuning::FOLLOWUP_ONE_PENALTY;
                         if (next_state.has_adjacent_powerup(simulated_head_pos)) {
-                            score += 7000;
+                            score += BotTuning::ADJ_POWERUP_BONUS;
                         }
 
                         if (next_cell == CELL_POWERUP && !out_of_time()) {
-                            GameState delayed_state = next_state;
-                            vector<int> delayed_my_actions = infer_default_actions(delayed_state.my_snakes);
-                            vector<int> delayed_opp_actions = infer_default_actions(delayed_state.opp_snakes);
-                            int my_index_delayed = find_my_snake_index(delayed_state, s.id);
-                            if (my_index_delayed != -1) {
-                                delayed_my_actions[my_index_delayed] = infer_previous_action(*next_self);
-                            }
-                            delayed_state.simulate(delayed_my_actions, delayed_opp_actions);
-                            const Snake* delayed_self = delayed_state.find_my_snake_by_id(s.id);
-                            if (delayed_self == nullptr || !delayed_self->is_alive) {
-                                score -= 70000;
-                            }
+                            int delayed_risk = delayed_powerup_risk_penalty(state, s.id, a, 3);
+                            score -= delayed_risk;
                         }
 
                         if (!powerup_positions.empty() && !out_of_time()) {
@@ -1738,7 +3049,20 @@ int main() {
             current_my_actions[s_idx] = best_action;
 
             // Format ID ACTION
-            action_strs.push_back(to_string(s.id) + " " + action_to_string(best_action));
+            append_action_with_target(s_idx, best_action);
+        }
+
+        unordered_set<int> marked_targets;
+        int mark_budget = 4;
+        for (size_t i = 0; i < target_plan.target_positions.size() && mark_budget > 0; ++i) {
+            int tpos = target_plan.target_positions[i];
+            if (tpos < 0 || !is_playable_cell(tpos)) continue;
+            if (marked_targets.count(tpos)) continue;
+            int tx = (tpos % max_width) - max_len;
+            int ty = (tpos / max_width) - max_len;
+            action_strs.push_back("MARK " + to_string(tx) + " " + to_string(ty));
+            marked_targets.insert(tpos);
+            mark_budget--;
         }
         
         // Join actions with semicolons
@@ -1752,6 +3076,7 @@ int main() {
         auto iter_elapsed = duration_cast<microseconds>(high_resolution_clock::now() - iter_start);
         
         mylog << "Turn " << counter << " elapsed: " << iter_elapsed.count() << "ys, output: " << output << '\n';
+        mylog.flush();
         cout << output << endl;
     }
 }
