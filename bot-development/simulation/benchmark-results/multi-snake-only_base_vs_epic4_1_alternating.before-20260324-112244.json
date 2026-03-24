@@ -1,0 +1,92 @@
+{
+  "summary": {
+    "maps_total": 7,
+    "maps_completed": 7,
+    "maps_errors": 0,
+    "new_wins": 0,
+    "base_wins": 6,
+    "ties": 1,
+    "new_total_sum": 102,
+    "base_total_sum": 213,
+    "aggregate_delta_new_minus_base": -111
+  },
+  "results": [
+    {
+      "map": "bot-development/test-maps/multi-snake/10a-smallmap-2v2-E6Sx-many-targets.txt",
+      "base_as_p1": 5,
+      "new_as_p2": 5,
+      "new_as_p1": 5,
+      "base_as_p2": 5,
+      "base_total": 10,
+      "new_total": 10,
+      "delta_new_minus_base": 0,
+      "winner": "tie"
+    },
+    {
+      "map": "bot-development/test-maps/multi-snake/10b-smallmap-4v4-E6Sx-many-targets.txt",
+      "base_as_p1": 16,
+      "new_as_p2": 6,
+      "new_as_p1": 8,
+      "base_as_p2": 16,
+      "base_total": 32,
+      "new_total": 14,
+      "delta_new_minus_base": -18,
+      "winner": "base"
+    },
+    {
+      "map": "bot-development/test-maps/multi-snake/11a-midmap-3v3-E6Sx-many-targets.txt",
+      "base_as_p1": 18,
+      "new_as_p2": 9,
+      "new_as_p1": 9,
+      "base_as_p2": 18,
+      "base_total": 36,
+      "new_total": 18,
+      "delta_new_minus_base": -18,
+      "winner": "base"
+    },
+    {
+      "map": "bot-development/test-maps/multi-snake/12a-bigmap-2v2-E6Sx-many-targets..txt",
+      "base_as_p1": 11,
+      "new_as_p2": 9,
+      "new_as_p1": 9,
+      "base_as_p2": 11,
+      "base_total": 22,
+      "new_total": 18,
+      "delta_new_minus_base": -4,
+      "winner": "base"
+    },
+    {
+      "map": "bot-development/test-maps/multi-snake/12b-bigmap-3v3-E6Sx-many-targets.txt",
+      "base_as_p1": 17,
+      "new_as_p2": 3,
+      "new_as_p1": 0,
+      "base_as_p2": 10,
+      "base_total": 27,
+      "new_total": 3,
+      "delta_new_minus_base": -24,
+      "winner": "base"
+    },
+    {
+      "map": "bot-development/test-maps/multi-snake/12c-bigmap-4v4-E6Sx-many-targets.txt",
+      "base_as_p1": 25,
+      "new_as_p2": 10,
+      "new_as_p1": 6,
+      "base_as_p2": 18,
+      "base_total": 43,
+      "new_total": 16,
+      "delta_new_minus_base": -27,
+      "winner": "base"
+    },
+    {
+      "map": "bot-development/test-maps/multi-snake/12t-bigmap-E6Sx-team-long-term-many-targets.txt",
+      "base_as_p1": 21,
+      "new_as_p2": 10,
+      "new_as_p1": 13,
+      "base_as_p2": 22,
+      "base_total": 43,
+      "new_total": 23,
+      "delta_new_minus_base": -20,
+      "winner": "base"
+    }
+  ]
+}

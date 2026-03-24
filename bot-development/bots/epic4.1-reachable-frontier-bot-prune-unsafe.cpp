@@ -372,65 +372,37 @@ struct GameState {
         move_snakes(opp_snakes, opp_actions);
     }
 
-    inline void resolve_collisions() {
+    inline vector<Snake*> collect_live_snakes() {
         vector<Snake*> all_snakes;
+        all_snakes.reserve(my_snakes.size() + opp_snakes.size());
         for (auto& s : my_snakes) if (s.is_alive) all_snakes.push_back(&s);
         for (auto& s : opp_snakes) if (s.is_alive) all_snakes.push_back(&s);
+        return all_snakes;
+    }
 
-        vector<int> head_positions(all_snakes.size());
-        vector<bool> to_destroy(all_snakes.size(), false);
-        vector<bool> ate_powerup(all_snakes.size(), false);
-        for (size_t i = 0; i < all_snakes.size(); ++i) {
-            head_positions[i] = all_snakes[i]->body[all_snakes[i]->head_idx];
+    inline bool snake_body_contains(const Snake& s, int pos) const {
+        for (int k = 0; k < s.length; ++k) {
+            int b_idx = (s.head_idx + k) % ring_size(s);
+            if (s.body[b_idx] == pos) return true;
+        }
+        return false;
+    }
+
+    inline bool snake_body_contains_except_head(const Snake& s, int pos) const {
+        for (int k = 1; k < s.length; ++k) {
+            int b_idx = (s.head_idx + k) % ring_size(s);
+            if (s.body[b_idx] == pos) return true;
+        }
+        return false;
+    }
+
+    inline void repaint_snakes_on_grid() {
+        for (int i = 0; i < grid_size; ++i) {
+            if (grid[i] >= CELL_SNAKE_BASE) grid[i] = CELL_EMPTY;
         }
 
-        for (size_t i = 0; i < all_snakes.size(); ++i) {
-            int h_pos = head_positions[i];
-            if (h_pos < 0 || h_pos >= grid_size) {
-                to_destroy[i] = true;
-                continue;
-            }
-            int cell_val = grid[h_pos];
-            if (cell_val == CELL_WALL || cell_val >= CELL_SNAKE_BASE) to_destroy[i] = true;
-            else if (cell_val == CELL_POWERUP) ate_powerup[i] = true;
-
-            for (size_t j = i + 1; j < all_snakes.size(); ++j) {
-                if (head_positions[i] == head_positions[j]) {
-                    to_destroy[i] = true;
-                    to_destroy[j] = true;
-                }
-            }
-        }
-
-        for (size_t i = 0; i < all_snakes.size(); ++i) {
-            Snake* s = all_snakes[i];
-            if (ate_powerup[i]) {
-                s->tail_idx = (s->tail_idx + 1) % ring_size(*s);
-                s->length++;
-            }
-            if (to_destroy[i]) {
-                s->length--;
-                s->head_idx = (s->head_idx + 1) % ring_size(*s);
-                if (s->length < 3) {
-                    s->is_alive = false;
-                    for (int k = 0; k < max(0, s->length); ++k) {
-                        int b_idx = (s->head_idx + k) % ring_size(*s);
-                        int pos = s->body[b_idx];
-                        if (pos >= 0 && pos < grid_size) grid[pos] = CELL_EMPTY;
-                    }
-                }
-            }
-        }
-
-        for (size_t i = 0; i < all_snakes.size(); ++i) {
-            if (ate_powerup[i]) {
-                int h_pos = head_positions[i];
-                if (h_pos >= 0 && h_pos < grid_size) grid[h_pos] = CELL_EMPTY;
-            }
-        }
-
+        auto all_snakes = collect_live_snakes();
         for (Snake* s : all_snakes) {
-            if (!s->is_alive) continue;
             for (int k = 0; k < s->length; ++k) {
                 int b_idx = (s->head_idx + k) % ring_size(*s);
                 int pos = s->body[b_idx];
@@ -439,10 +411,71 @@ struct GameState {
         }
     }
 
+    inline void apply_eats() {
+        auto all_snakes = collect_live_snakes();
+        unordered_set<int> eaten_positions;
+        for (Snake* s : all_snakes) {
+            int h_pos = s->body[s->head_idx];
+            if (h_pos >= 0 && h_pos < grid_size && grid[h_pos] == CELL_POWERUP) {
+                s->tail_idx = (s->tail_idx + 1) % ring_size(*s);
+                s->length++;
+                eaten_positions.insert(h_pos);
+            }
+        }
+
+        for (int pos : eaten_positions) {
+            if (pos >= 0 && pos < grid_size && grid[pos] == CELL_POWERUP) {
+                grid[pos] = CELL_EMPTY;
+            }
+        }
+
+        repaint_snakes_on_grid();
+    }
+
+    inline void apply_beheadings() {
+        auto all_snakes = collect_live_snakes();
+        vector<Snake*> snakes_to_behead;
+        snakes_to_behead.reserve(all_snakes.size());
+
+        for (Snake* s : all_snakes) {
+            int h_pos = s->body[s->head_idx];
+            bool is_in_wall = (h_pos < 0 || h_pos >= grid_size || grid[h_pos] == CELL_WALL);
+
+            bool intersects_other = false;
+            for (Snake* other : all_snakes) {
+                if (!snake_body_contains(*other, h_pos)) continue;
+                if (other->id != s->id) {
+                    intersects_other = true;
+                    break;
+                }
+            }
+
+            bool intersects_self = snake_body_contains_except_head(*s, h_pos);
+            if (is_in_wall || intersects_other || intersects_self) {
+                snakes_to_behead.push_back(s);
+            }
+        }
+
+        for (Snake* s : snakes_to_behead) {
+            if (!s->is_alive) continue;
+            if (s->length <= 3) {
+                s->is_alive = false;
+                s->length = 0;
+                continue;
+            }
+
+            s->head_idx = (s->head_idx + 1) % ring_size(*s);
+            s->length--;
+        }
+
+        repaint_snakes_on_grid();
+    }
+
     inline void simulate(const vector<int>& my_actions, const vector<int>& opp_actions) {
         apply_movement(my_actions, opp_actions);
+        apply_eats();
+        apply_beheadings();
         apply_gravity();
-        resolve_collisions();
     }
 
     const Snake* find_my_snake_by_id(int snake_id) const {
