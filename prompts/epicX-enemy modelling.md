@@ -19,3 +19,6 @@ pathing/\*corridor\*.txt
 # curl in 2x2 box
 a snake must be able to know its tail will free a cell and follow it. 
 bot-development/test-maps/complex-pathing/07-do-curl_up-angled-snake.txt
+
+# hint
+also trying to simulate the opponent, but not spending too much time, so i just pick the best opponent move combination for each of my combinations according to same evaluation function * -1

@@ -16,7 +16,6 @@ there are a few engines for similar yet distinct projects in the folder:
 - sagemaker-battlesnake-ai is another gym probably.
 
 other resourses: 
-- qwen-agent is a possible agentic workflow infrastructure for iterative agentic implementation of the final bot
 - pdfs-from-academia is folder with research results on possibly good algorithms for the task
 
 constraints:
