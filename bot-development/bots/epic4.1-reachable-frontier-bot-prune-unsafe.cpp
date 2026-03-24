@@ -498,7 +498,18 @@ struct GameState {
             if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
             int n_pos = ny * max_width + nx;
             int16_t next_cell = grid[n_pos];
-            if (next_cell == CELL_WALL || next_cell >= CELL_SNAKE_BASE) continue;
+            bool enterable = false;
+            if (next_cell != CELL_WALL) {
+                if (next_cell < CELL_SNAKE_BASE) {
+                    enterable = true;
+                } else {
+                    int occ_id = next_cell - CELL_SNAKE_BASE;
+                    if (occ_id == s.id && s.length > 0 && n_pos == s.body[s.tail_idx]) {
+                        enterable = true;
+                    }
+                }
+            }
+            if (!enterable) continue;
             if (survives_flood_fill(n_pos, max(2, s.length / 2))) safe_count++;
         }
         return safe_count;
@@ -532,6 +543,19 @@ static bool is_goal_cell_valid(const GameState& state, int pos) {
     return cell != CELL_WALL;
 }
 
+static bool is_enterable_cell_for_snake(const GameState& state, const Snake& s, int pos) {
+    if (pos < 0 || pos >= grid_size) return false;
+    int16_t cell = state.grid[pos];
+    if (cell == CELL_WALL) return false;
+    if (cell < CELL_SNAKE_BASE) return true;
+
+    int occ_id = cell - CELL_SNAKE_BASE;
+    if (occ_id != s.id) return false;
+    if (s.length <= 0) return false;
+    int tail_pos = s.body[s.tail_idx];
+    return pos == tail_pos;
+}
+
 static int first_legal_action_basic(const GameState& state, const Snake& s) {
     int head_pos = s.body[s.head_idx];
     int hx = head_pos % max_width;
@@ -544,8 +568,7 @@ static int first_legal_action_basic(const GameState& state, const Snake& s) {
         int ny = hy + dy[a];
         if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
         int n_pos = ny * max_width + nx;
-        int16_t cell = state.grid[n_pos];
-        if (cell == CELL_WALL || cell >= CELL_SNAKE_BASE) continue;
+        if (!is_enterable_cell_for_snake(state, s, n_pos)) continue;
         return a;
     }
     return infer_previous_action(s);
@@ -565,8 +588,7 @@ static bool is_action_locally_legal(const GameState& state, const Snake& s, int 
     if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) return false;
 
     int n_pos = ny * max_width + nx;
-    int16_t cell = state.grid[n_pos];
-    return cell != CELL_WALL && cell < CELL_SNAKE_BASE;
+    return is_enterable_cell_for_snake(state, s, n_pos);
 }
 
 static const Snake* find_any_snake_by_id(const GameState& state, int snake_id) {
@@ -733,8 +755,7 @@ static int count_simulated_safe_followups(const GameState& state, const Snake& s
         if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
 
         int n_pos = ny * max_width + nx;
-        int16_t cell = state.grid[n_pos];
-        if (cell == CELL_WALL || cell >= CELL_SNAKE_BASE) continue;
+        if (!is_enterable_cell_for_snake(state, s, n_pos)) continue;
 
         GameState probe = state;
         vector<int> my_actions = infer_default_actions(probe.my_snakes);
@@ -767,8 +788,7 @@ static int count_simulated_safe_followthrough_moves(const GameState& state, cons
         if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
 
         int n_pos = ny * max_width + nx;
-        int16_t cell = state.grid[n_pos];
-        if (cell == CELL_WALL || cell >= CELL_SNAKE_BASE) continue;
+        if (!is_enterable_cell_for_snake(state, s, n_pos)) continue;
 
         GameState probe = state;
         vector<int> my_actions = infer_default_actions(probe.my_snakes);
@@ -1272,8 +1292,7 @@ static bool has_reachable_future_growth(const GameState& state, int snake_id, in
             if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
 
             int n_pos = ny * max_width + nx;
-            int16_t next_cell = node.state.grid[n_pos];
-            if (next_cell == CELL_WALL || next_cell >= CELL_SNAKE_BASE) continue;
+            if (!is_enterable_cell_for_snake(node.state, *cur_self, n_pos)) continue;
 
             GameState next_state = node.state;
             vector<int> my_actions = infer_default_actions(next_state.my_snakes);
@@ -1404,8 +1423,7 @@ static FrontierScanResult scan_reachable_frontier(
             int ny = hy + dy[a];
             if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
             int n_pos = ny * max_width + nx;
-            int16_t next_cell = node.state.grid[n_pos];
-            if (next_cell == CELL_WALL || next_cell >= CELL_SNAKE_BASE) continue;
+            if (!is_enterable_cell_for_snake(node.state, *cur_self, n_pos)) continue;
 
             // Right before creating the child node at depth 0
             int first_action = (node.first_action == -1) ? a : node.first_action;
