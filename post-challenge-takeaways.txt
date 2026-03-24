@@ -1,0 +1,12 @@
+see folder bot-development/post-challenge-takeaways
+
+the bot that was ranker 1537 / 2332 was epic 4 frontier cpp I think.
+https://www.codingame.com/contests/winter-challenge-2026-exotec/leaderboard/global
+
+Most bots never passed the test maps with satisfactory results and were never deployed in codingame. 
+
+
+# Final submissions
+If you submit code 1-2 minutes before the deadline, then the code evaluation is run after the deadline. 
+
+In Legendary league, after all late submissions are evaluated, another final pass is run with all participants's final versions. 
