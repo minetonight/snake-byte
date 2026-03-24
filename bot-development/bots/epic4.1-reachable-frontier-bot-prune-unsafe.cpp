@@ -38,6 +38,8 @@ static constexpr int SCAN_DEPTH_LARGE = 26;
 static constexpr int DIRECT_APPLE_MAX_DIST = 10;
 static constexpr int LONG_TERM_GOAL_TTL = 20;
 static constexpr int APPLE_GOAL_TTL = 28;
+static constexpr int PATROL_GOAL_TTL = 10;
+static constexpr int PATROL_WAYPOINT_COUNT = 5;
 static constexpr int DEEP_SCAN_BUDGET_PCT = 70;
 static constexpr int FOLLOWTHROUGH_BUDGET_PCT = 20;
 static constexpr int TURN_RESERVE_BUDGET_PCT = 10;
@@ -185,6 +187,7 @@ struct DirectAppleHint {
 
 unordered_map<int, PersistentGoal> g_center_goal_by_snake;
 unordered_map<int, PersistentGoal> g_apple_goal_by_snake;
+unordered_map<int, int> g_patrol_phase_by_snake;
 
 struct Snake {
     int id = -1;
@@ -950,6 +953,228 @@ static int choose_center_anchor_cell(const GameState& state, int exclude_pos = -
     return best_pos;
 }
 
+struct VoronoiSummary {
+    vector<int> my_dist;
+    vector<int> opp_dist;
+    vector<int8_t> owner;
+};
+
+static void run_multi_source_bfs(const GameState& state, const vector<int>& starts, vector<int>& dist_out) {
+    dist_out.assign(grid_size, -1);
+    queue<int> q;
+    for (int pos : starts) {
+        if (!is_playable_cell(pos)) continue;
+        if (dist_out[pos] != -1) continue;
+        dist_out[pos] = 0;
+        q.push(pos);
+    }
+
+    int dx[] = {0, 0, -1, 1};
+    int dy[] = {-1, 1, 0, 0};
+    while (!q.empty() && !out_of_time()) {
+        int pos = q.front();
+        q.pop();
+        int cx = pos % max_width;
+        int cy = pos / max_width;
+        for (int i = 0; i < 4; ++i) {
+            int nx = cx + dx[i];
+            int ny = cy + dy[i];
+            if (nx < 0 || nx >= max_width || ny < 0 || ny >= max_height) continue;
+            int n_pos = ny * max_width + nx;
+            if (!is_playable_cell(n_pos)) continue;
+            if (dist_out[n_pos] != -1) continue;
+            int16_t cell = state.grid[n_pos];
+            if (cell == CELL_WALL || cell >= CELL_SNAKE_BASE) continue;
+            dist_out[n_pos] = dist_out[pos] + 1;
+            q.push(n_pos);
+        }
+    }
+}
+
+static VoronoiSummary compute_voronoi_summary(const GameState& state) {
+    VoronoiSummary summary;
+    summary.my_dist.assign(grid_size, -1);
+    summary.opp_dist.assign(grid_size, -1);
+    summary.owner.assign(grid_size, -1);
+
+    vector<int> my_starts;
+    vector<int> opp_starts;
+    my_starts.reserve(state.my_snakes.size());
+    opp_starts.reserve(state.opp_snakes.size());
+
+    for (const Snake& s : state.my_snakes) {
+        if (!s.is_alive || s.length <= 0) continue;
+        my_starts.push_back(s.body[s.head_idx]);
+    }
+    for (const Snake& s : state.opp_snakes) {
+        if (!s.is_alive || s.length <= 0) continue;
+        opp_starts.push_back(s.body[s.head_idx]);
+    }
+
+    run_multi_source_bfs(state, my_starts, summary.my_dist);
+    run_multi_source_bfs(state, opp_starts, summary.opp_dist);
+
+    for (int pos = 0; pos < grid_size; ++pos) {
+        int md = summary.my_dist[pos];
+        int od = summary.opp_dist[pos];
+        if (md == -1 && od == -1) summary.owner[pos] = -1;
+        else if (od == -1 || (md != -1 && md < od)) summary.owner[pos] = 0;
+        else if (md == -1 || od < md) summary.owner[pos] = 1;
+        else summary.owner[pos] = 2;
+    }
+
+    return summary;
+}
+
+static int voronoi_priority_for_apple(const VoronoiSummary* summary, int apple_pos) {
+    if (summary == nullptr || apple_pos < 0 || apple_pos >= grid_size) return 1;
+    int8_t owner = summary->owner[apple_pos];
+    if (owner == 0) return 2;
+    if (owner == 2) return 1;
+    if (owner == 1) return 0;
+    return 1;
+}
+
+static bool is_target_contested_by_voronoi(const VoronoiSummary& summary, const Snake& self, int target_pos, int strongest_opp_len) {
+    if (target_pos < 0 || target_pos >= grid_size) return false;
+    int md = summary.my_dist[target_pos];
+    int od = summary.opp_dist[target_pos];
+    if (od == -1) return false;
+    if (md == -1) return true;
+    if (od < md) return true;
+    if (od == md && strongest_opp_len >= self.length) return true;
+    return false;
+}
+
+static vector<int> build_patrol_waypoints(const GameState& state) {
+    vector<int> waypoints;
+    waypoints.reserve(PATROL_WAYPOINT_COUNT);
+
+    int center_x = max_len + world_width / 2;
+    int center_y = max_len + world_height / 2;
+    int quarter_x = max(1, world_width / 4);
+    int quarter_y = max(1, world_height / 4);
+
+    vector<pair<int, int>> anchors = {
+        {center_x, center_y},
+        {center_x - quarter_x, center_y},
+        {center_x + quarter_x, center_y},
+        {center_x, center_y - quarter_y},
+        {center_x, center_y + quarter_y},
+    };
+
+    for (const auto& [ax, ay] : anchors) {
+        int cx = min(max_len + world_width - 1, max(max_len, ax));
+        int cy = min(max_len + world_height - 1, max(max_len, ay));
+        int pos = cy * max_width + cx;
+        if (!is_goal_cell_valid(state, pos)) continue;
+        bool duplicate = false;
+        for (int existing : waypoints) {
+            if (existing == pos) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) waypoints.push_back(pos);
+    }
+
+    if (waypoints.empty()) {
+        int fallback = choose_center_anchor_cell(state, -1);
+        if (fallback != -1) waypoints.push_back(fallback);
+    }
+
+    return waypoints;
+}
+
+static PersistentGoal get_or_refresh_patrol_goal(const GameState& state, const Snake& s) {
+    auto it = g_center_goal_by_snake.find(s.id);
+    if (it != g_center_goal_by_snake.end()
+        && it->second.expires_turn > g_turn_counter
+        && is_goal_cell_valid(state, it->second.target_pos)
+        && it->second.target_pos != s.body[s.head_idx]) {
+        return it->second;
+    }
+
+    vector<int> waypoints = build_patrol_waypoints(state);
+    int& patrol_phase = g_patrol_phase_by_snake[s.id];
+    if (patrol_phase < 0) patrol_phase = 0;
+
+    int target = -1;
+    if (!waypoints.empty()) {
+        int idx = patrol_phase % static_cast<int>(waypoints.size());
+        target = waypoints[idx];
+        patrol_phase = (patrol_phase + 1) % static_cast<int>(waypoints.size());
+    }
+
+    PersistentGoal goal;
+    goal.target_pos = target;
+    goal.expires_turn = g_turn_counter + PATROL_GOAL_TTL;
+    g_center_goal_by_snake[s.id] = goal;
+    return goal;
+}
+
+static unordered_map<int, int> assign_team_apple_targets(const GameState& state, const VoronoiSummary& voronoi) {
+    unordered_map<int, int> assigned;
+    vector<int> apples;
+    apples.reserve(32);
+    for (int pos = 0; pos < grid_size; ++pos) {
+        if (state.grid[pos] == CELL_POWERUP) apples.push_back(pos);
+    }
+    if (apples.empty()) return assigned;
+
+    vector<const Snake*> snakes;
+    snakes.reserve(state.my_snakes.size());
+    for (const Snake& s : state.my_snakes) {
+        if (s.is_alive && s.length > 0) snakes.push_back(&s);
+    }
+    sort(snakes.begin(), snakes.end(), [](const Snake* a, const Snake* b) {
+        if (a->length != b->length) return a->length > b->length;
+        return a->id < b->id;
+    });
+
+    unordered_set<int> used_apples;
+    int center_x = max_len + world_width / 2;
+    int center_y = max_len + world_height / 2;
+    int center_pos = center_y * max_width + center_x;
+
+    for (const Snake* self : snakes) {
+        int best_target = -1;
+        int best_used = 2;
+        int best_priority = -1;
+        int best_dist = INT_MAX;
+        int best_center_dist = INT_MAX;
+
+        int self_head = self->body[self->head_idx];
+        for (int apple_pos : apples) {
+            int dist = shortest_path_distance_walls_only(state, self_head, apple_pos);
+            if (dist == INT_MAX) continue;
+
+            int used = (used_apples.find(apple_pos) != used_apples.end()) ? 1 : 0;
+            int priority = voronoi_priority_for_apple(&voronoi, apple_pos);
+            int center_dist = manhattan_dist_pos(apple_pos, center_pos);
+
+            if (best_target == -1
+                || used < best_used
+                || (used == best_used && priority > best_priority)
+                || (used == best_used && priority == best_priority && dist < best_dist)
+                || (used == best_used && priority == best_priority && dist == best_dist && center_dist < best_center_dist)) {
+                best_target = apple_pos;
+                best_used = used;
+                best_priority = priority;
+                best_dist = dist;
+                best_center_dist = center_dist;
+            }
+        }
+
+        if (best_target != -1) {
+            assigned[self->id] = best_target;
+            used_apples.insert(best_target);
+        }
+    }
+
+    return assigned;
+}
+
 struct FrontierScanResult {
     bool found_apple = false;
     int apple_action = -1;
@@ -957,6 +1182,7 @@ struct FrontierScanResult {
     int apple_depth = INT_MAX;
     int apple_followups = -1;
     int apple_goal_dist = INT_MAX;
+    int apple_owner_priority = -1;
 
     bool found_apple_progress = false;
     int apple_progress_action = -1;
@@ -964,6 +1190,7 @@ struct FrontierScanResult {
     int apple_progress_dist = INT_MAX;
     int apple_progress_depth = INT_MAX;
     int apple_progress_followups = -1;
+    int apple_progress_owner_priority = -1;
 
     bool found_goal_progress = false;
     int goal_action = -1;
@@ -982,6 +1209,7 @@ struct AppleProgressCandidate {
     int dist = INT_MAX;
     int depth = INT_MAX;
     int followups = -1;
+    int owner_priority = -1;
 };
 
 struct SearchNode {
@@ -1071,7 +1299,13 @@ static bool has_reachable_future_growth(const GameState& state, int snake_id, in
     return false;
 }
 
-static FrontierScanResult scan_reachable_frontier(const GameState& state, int snake_id, const ScanBudgetConfig& budget, int desired_goal_pos) {
+static FrontierScanResult scan_reachable_frontier(
+    const GameState& state,
+    int snake_id,
+    const ScanBudgetConfig& budget,
+    int desired_goal_pos,
+    const VoronoiSummary* voronoi
+) {
     FrontierScanResult result;
     GameState start_state = isolate_state_for_single_snake_planning(state, snake_id);
     const Snake* start_self = start_state.find_my_snake_by_id(snake_id);
@@ -1125,8 +1359,10 @@ static FrontierScanResult scan_reachable_frontier(const GameState& state, int sn
             for (int p : initial_powerups) {
                 if (node.state.grid[p] != CELL_POWERUP) continue;
                 int d = manhattan_dist_pos(node.head_pos, p);
+                int owner_priority = voronoi_priority_for_apple(voronoi, p);
                 AppleProgressCandidate& candidate = apple_progress_by_target[p];
                 if (candidate.target == -1
+                    || owner_priority > candidate.owner_priority
                     || d < candidate.dist
                     || (d == candidate.dist && followups > candidate.followups)
                     || (d == candidate.dist && followups == candidate.followups && node.depth < candidate.depth)) {
@@ -1135,6 +1371,7 @@ static FrontierScanResult scan_reachable_frontier(const GameState& state, int sn
                     candidate.dist = d;
                     candidate.depth = node.depth;
                     candidate.followups = followups;
+                    candidate.owner_priority = owner_priority;
                 }
             }
         }
@@ -1170,6 +1407,19 @@ static FrontierScanResult scan_reachable_frontier(const GameState& state, int sn
             int16_t next_cell = node.state.grid[n_pos];
             if (next_cell == CELL_WALL || next_cell >= CELL_SNAKE_BASE) continue;
 
+            // Right before creating the child node at depth 0
+            int first_action = (node.first_action == -1) ? a : node.first_action;
+            
+            // NEW: if this is a root-level action, check against real state
+            if (node.first_action == -1) {
+                // 'state' here is the original unmodified state passed to the function
+                const Snake* real_self = state.find_my_snake_by_id(snake_id);
+                if (real_self != nullptr &&
+                    is_action_immediately_unsafe_against_stronger_snake(state, *real_self, a)) {
+                    continue;  // prune entire subtree
+                }
+            }
+
             GameState next_state = node.state;
             vector<int> my_actions = infer_default_actions(next_state.my_snakes);
             vector<int> opp_actions;
@@ -1184,10 +1434,10 @@ static FrontierScanResult scan_reachable_frontier(const GameState& state, int sn
             if (!is_playable_cell(next_head)) continue;
             if (snake_body_hash(*next_self) == snake_body_hash(*cur_self) && next_self->length == cur_self->length) continue;
 
-            int first_action = (node.first_action == -1) ? a : node.first_action;
             int next_depth = node.depth + 1;
             int followups = next_state.count_safe_followups(*next_self);
             int goal_dist = (desired_goal_pos != -1) ? manhattan_dist_pos(next_head, desired_goal_pos) : INT_MAX;
+            int owner_priority = voronoi_priority_for_apple(voronoi, next_head);
 
             if (next_self->length > cur_self->length) {
                 int simulated_followups = count_simulated_safe_followups(next_state, *next_self);
@@ -1216,6 +1466,7 @@ static FrontierScanResult scan_reachable_frontier(const GameState& state, int sn
                 }
                 if (!result.found_apple
                     || next_depth < result.apple_depth
+                    || (next_depth == result.apple_depth && owner_priority > result.apple_owner_priority)
                     || (next_depth == result.apple_depth && simulated_followups > result.apple_followups)
                     || (next_depth == result.apple_depth && simulated_followups == result.apple_followups && goal_dist < result.apple_goal_dist)) {
                     result.found_apple = true;
@@ -1224,6 +1475,7 @@ static FrontierScanResult scan_reachable_frontier(const GameState& state, int sn
                     result.apple_depth = next_depth;
                     result.apple_followups = simulated_followups;
                     result.apple_goal_dist = goal_dist;
+                    result.apple_owner_priority = owner_priority;
                 }
             }
 
@@ -1242,6 +1494,7 @@ static FrontierScanResult scan_reachable_frontier(const GameState& state, int sn
         if (candidate.action == -1 || candidate.target == -1) continue;
         if (dead_end_apple_targets.find(target) != dead_end_apple_targets.end()) continue;
         if (!result.found_apple_progress
+            || candidate.owner_priority > result.apple_progress_owner_priority
             || candidate.dist < result.apple_progress_dist
             || (candidate.dist == result.apple_progress_dist && candidate.followups > result.apple_progress_followups)
             || (candidate.dist == result.apple_progress_dist && candidate.followups == result.apple_progress_followups && candidate.depth < result.apple_progress_depth)) {
@@ -1251,6 +1504,7 @@ static FrontierScanResult scan_reachable_frontier(const GameState& state, int sn
             result.apple_progress_dist = candidate.dist;
             result.apple_progress_depth = candidate.depth;
             result.apple_progress_followups = candidate.followups;
+            result.apple_progress_owner_priority = candidate.owner_priority;
         }
     }
 
@@ -1353,6 +1607,7 @@ static PersistentGoal get_or_refresh_center_goal(const GameState& state, const S
 
 static void clear_center_goal(int snake_id) {
     g_center_goal_by_snake.erase(snake_id);
+    g_patrol_phase_by_snake.erase(snake_id);
 }
 
 static PersistentGoal get_valid_apple_goal(const GameState& state, const Snake& s) {
@@ -1526,6 +1781,13 @@ int main() {
         }
 
         turn_start_time = high_resolution_clock::now();
+        VoronoiSummary voronoi = compute_voronoi_summary(state);
+        unordered_map<int, int> team_apple_targets = assign_team_apple_targets(state, voronoi);
+        int strongest_opp_len = 0;
+        for (const Snake& other : state.opp_snakes) {
+            if (!other.is_alive || other.length <= 0) continue;
+            strongest_opp_len = max(strongest_opp_len, other.length);
+        }
 
         vector<string> action_strs;
         vector<int> current_my_actions(state.my_snakes.size(), 0);
@@ -1547,9 +1809,11 @@ int main() {
 
             int head_pos = s.body[s.head_idx];
             int desired_goal = -1;
+            bool using_patrol_goal = false;
+            bool using_team_apple_goal = false;
             PersistentGoal apple_goal = get_valid_apple_goal(state, s);
             bool apple_goal_contested = (apple_goal.target_pos != -1)
-                && is_target_contested_by_stronger_snake(state, s, apple_goal.target_pos);
+                && is_target_contested_by_voronoi(voronoi, s, apple_goal.target_pos, strongest_opp_len);
             if (apple_goal_contested) {
                 clear_apple_goal(s.id);
                 apple_goal = {};
@@ -1558,12 +1822,24 @@ int main() {
             if (apple_goal.target_pos != -1) {
                 desired_goal = apple_goal.target_pos;
             } else {
-                PersistentGoal center_goal = get_or_refresh_center_goal(state, s);
-                desired_goal = center_goal.target_pos;
+                auto team_target_it = team_apple_targets.find(s.id);
+                if (team_target_it != team_apple_targets.end()) {
+                    int team_target = team_target_it->second;
+                    if (team_target >= 0 && team_target < grid_size && state.grid[team_target] == CELL_POWERUP) {
+                        desired_goal = team_target;
+                        using_team_apple_goal = true;
+                    }
+                }
+            }
+
+            if (desired_goal == -1) {
+                PersistentGoal patrol_goal = get_or_refresh_patrol_goal(state, s);
+                desired_goal = patrol_goal.target_pos;
+                using_patrol_goal = true;
             }
 
             ScanBudgetConfig scan_budget = choose_scan_budget(state, s, s_idx, state.my_snakes.size(), apple_goal.target_pos != -1);
-            FrontierScanResult scan = scan_reachable_frontier(state, s.id, scan_budget, desired_goal);
+            FrontierScanResult scan = scan_reachable_frontier(state, s.id, scan_budget, desired_goal, &voronoi);
 
             int chosen_action = -1;
             int chosen_target = -1;
@@ -1571,7 +1847,7 @@ int main() {
 
             bool apple_progress_contested = scan.found_apple_progress
                 && scan.apple_progress_target != -1
-                && is_target_contested_by_stronger_snake(state, s, scan.apple_progress_target);
+                && is_target_contested_by_voronoi(voronoi, s, scan.apple_progress_target, strongest_opp_len);
             bool prefer_goal_anchor_over_distant_apple_progress = scan.found_goal_progress
                 && desired_goal != -1
                 && scan.goal_dist != INT_MAX
@@ -1594,13 +1870,18 @@ int main() {
             } else if (scan.found_goal_progress && scan.goal_action != -1 && desired_goal != -1) {
                 chosen_action = scan.goal_action;
                 chosen_target = desired_goal;
-                mode = (apple_goal.target_pos != -1) ? "apple_goal" : "center_goal";
+                if (apple_goal.target_pos != -1) mode = "apple_goal";
+                else if (using_team_apple_goal) mode = "team_apple_goal";
+                else if (using_patrol_goal) mode = "patrol_goal";
+                else mode = "goal";
             }
 
             if (chosen_action == -1) {
                 chosen_action = first_legal_action_basic(state, s);
                 chosen_target = desired_goal;
-                mode = (apple_goal.target_pos != -1) ? "fallback_apple_goal" : "fallback_legal";
+                if (apple_goal.target_pos != -1 || using_team_apple_goal) mode = "fallback_apple_goal";
+                else if (using_patrol_goal) mode = "fallback_patrol_goal";
+                else mode = "fallback_legal";
             }
 
             if (chosen_action != -1 && is_action_immediately_unsafe_against_stronger_snake(state, s, chosen_action)) {
