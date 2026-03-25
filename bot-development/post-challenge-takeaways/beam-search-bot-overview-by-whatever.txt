@@ -1,0 +1,44 @@
+# 🧠 Bot Technical Overview: Beam Search & Heuristics
+
+This bot is written in highly optimized C++ and relies on a **Beam Search** algorithm heavily guided by complex, game-specific heuristics. The core philosophy was to maximize simulation speed by avoiding the standard library (no STL, no dynamic allocation) in favor of fixed-size C-style arrays, allowing the bot to search deep into the game tree.
+
+## 1. Core Architecture & Search Algorithm
+* **Algorithm:** Beam Search (Width = 15, Max Depth = 65).
+* **Transposition Table (TT):** A 1-million entry hash table (~16MB) tracks previously evaluated states using a custom Zobrist-like hashing function on snake body parts and apples. This prevents the beam from redundantly evaluating the same board state reached via different move orders.
+* **Path Caching (PV):** The bot caches the "Principal Variation" (the best path from the previous turn). If the best path is still valid, it seeds the new search, giving it a massive head start on subsequent turns.
+* **Branching Strategy:** To keep the search space manageable, the beam only branches on *our* snakes' moves. Enemy moves are predicted deterministically each step.
+
+## 2. Fast Simulation Engine
+The simulation perfectly replicates the game rules without allocating memory:
+* **Movement & Beheading:** Simulates movement, eating (growing), and collisions. If a head enters an invalid space (wall or body), it processes the "beheading" rule (losing length/dying).
+* **Gravity Resolution:** Handles falling iteratively. It identifies which snakes are airborne, drops them by 1 unit, checks for ground or snake collisions, and repeats until all physics settle in a single turn.
+
+## 3. Enemy Prediction Model (1-Ply)
+Instead of branching on enemy moves (which would explode the state space), the bot uses a dedicated greedy heuristic to predict enemy actions *before* evaluating our responses:
+* It calculates the safest move for the enemy.
+* If the enemy is close (≤ 10 tiles), it evaluates aggressive plays, trapping potential (cutting off our space), and territory control.
+* If the enemy is far, it defaults to gathering apples.
+
+## 4. The Evaluation Function (Heuristics)
+This is the brain of the bot. Every node in the beam search is scored based on several layered concepts:
+
+* **Physical Support DAG (Directed Acyclic Graph):**
+  The bot builds a support map to understand which snakes are standing on top of which. If Snake A is physically supported by Snake B, Snake B's length contributes to Snake A's "effective support length." The bot knows it can reach higher apples by climbing on its teammates.
+* **The "Doom" Penalty (Safety):** 
+  It calculates exactly how many safe turns a snake has before it falls into the abyss. It compares this against the distance to the nearest static safe platform. If a snake cannot realistically reach safety before falling, a massive "Doom" penalty is applied.
+* **Voronoi Space Control:**
+  A fast BFS expands outward from all snake heads to claim territory. Each snake requires a specific amount of space based on its length. If a snake's Voronoi space drops below its required length, a severe penalty is applied, steering the bot away from dead ends.
+* **Apple Racing & Territory:**
+  Apples aren't just scored by raw distance. The bot computes BFS distances around obstacles and compares our distance vs. the enemy's distance. We get bonuses for uncontested apples and penalties if the enemy is guaranteed to beat us to one. 
+  
+  It also applies a "Cluster Bonus" if many apples are grouped together.
+  
+* **Pairwise Trade Compensation (Handling Simulation Asymmetry):**
+  Because the bot searches its own moves deeply (up to 65 ply) but uses a shallow, 1-ply greedy simulation for the enemy, an "evaluation asymmetry" occurs. The shallow enemy simulation will sometimes "hallucinate" that the enemy will make a foolish mistake and die. Without correction, the bot might happily accept a path where it sacrifices one of *our* snakes simply because it hallucinates an *enemy* snake dying elsewhere, making the raw score look like a fair 1-for-1 trade. To fix this, the bot pairs up doomed snakes from both teams and checks their distance. If they are physically close (≤ 30 tiles), it accepts it as a genuine combat trade and mathematically neutralizes the score variance. If they are far apart, it dismisses the enemy death as a shallow hallucination and heavily penalizes our own snake's death to prevent unnecessary suicides.
+* **Depth Decay:**
+  Final scores are multiplied by `0.97 ^ depth`. This makes the bot prioritize getting rewards *now* and pushes penalties (like dying) as far into the future as possible, effectively making it fight for survival until the last possible moment.
+
+## 5. Low-Level Optimizations
+* **Compiler Flags:** Forced `#pragma GCC optimize "Ofast, unroll-loops"` and target architectures (AVX2, BMI2).
+* **Precomputed Math:** Inverse distances (`1.0f / dist`) are precomputed in a lookup table to turn costly divisions into fast array lookups during BFS and heuristic scoring.
+* **Bitwise Limits:** Heavy use of bitwise operations for modulo (`& 16383` instead of `% 16384`) in circular queues.

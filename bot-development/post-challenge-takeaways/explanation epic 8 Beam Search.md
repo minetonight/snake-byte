@@ -681,7 +681,7 @@ some should survive because they are best growth states.
 This is a strong design pattern:
 rank within categories, not only globally.
 
-16. Tactical mode and lexicographic scoring
+# 16. Tactical mode and lexicographic scoring
 In sharp situations, the file activates tactical analysis.
 
 Relevant pieces:
@@ -690,7 +690,8 @@ analyze_tactical_branch()
 generate_tactical_followup_candidates()
 generate_tactical_opponent_reply_plans()
 TacticalLexicoScore
-What is lexicographic scoring?
+
+### What is lexicographic scoring?
 Instead of adding everything into one number, compare by priority list:
 
 keep more of my snakes alive
@@ -706,7 +707,7 @@ positional quality
 scalar fallback
 This is implemented in is_better_tactical_lexico_score().
 
-Why use lexicographic comparison?
+### Why use lexicographic comparison?
 In tactical combat, some things are not tradeable.
 
 For example:
@@ -716,7 +717,7 @@ Lexicographic order expresses hard priorities better than one weighted sum.
 
 This is a sophisticated idea, but intuitive in practice.
 
-17. Time management and search tuning
+# 17. Time management and search tuning
 The file is budgeted for about 50 ms:
 
 TURN_BUDGET_MS = 50
